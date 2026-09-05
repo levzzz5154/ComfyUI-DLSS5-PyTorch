@@ -40,13 +40,13 @@ _PIPELINE_CACHE: dict[tuple[str, int, int, str, str], DLSS5ModelHandle] = {}
 
 
 def _import_pipeline_class():
+    """Import the runtime vendored inside this custom-node repository."""
     try:
-        from mlxdlss.pipeline import NeuralRenderingPipeline
-    except ImportError as exc:
-        raise RuntimeError(
-            "The 'mlxdlss' Python package is not installed. Install this custom node's "
-            "requirements.txt and restart ComfyUI."
-        ) from exc
+        from .dlss5.pipeline import NeuralRenderingPipeline
+    except (ImportError, ValueError):
+        # Allows focused direct loading of nodes.py by tests/tools while the
+        # normal ComfyUI package import uses the relative path above.
+        from dlss5.pipeline import NeuralRenderingPipeline
     return NeuralRenderingPipeline
 
 
@@ -63,7 +63,7 @@ def _model_names() -> list[str]:
 def _resolve_model_path(model_name: str) -> str:
     if model_name == NO_MODEL_SENTINEL:
         raise FileNotFoundError(
-            f"No DLSS 5 logical safetensors were found. Put an MLX-DLSS fully-logical "
+            f"No DLSS 5 logical safetensors were found. Put a fully-logical "
             f".safetensors file in: {_MODEL_DIR}"
         )
 
@@ -137,7 +137,7 @@ def _matching_control_frame(control: np.ndarray | None, index: int, batch: int) 
 
 
 class DLSS5PyTorchModelLoader:
-    """Load MLX-DLSS fully-logical safetensors into the recovered PyTorch model."""
+    """Load fully-logical DLSS 5 safetensors into the recovered PyTorch model."""
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -245,6 +245,11 @@ class DLSS5PyTorchEnhance:
     ):
         if not isinstance(dlss5_model, DLSS5ModelHandle):
             raise TypeError("dlss5_model must come from the DLSS 5 PyTorch Model Loader node")
+        if batch_noise_mode not in {
+            "independent (same frame index)",
+            "sequence (advance frame index)",
+        }:
+            raise ValueError("unsupported batch_noise_mode")
 
         source = _image_batch_to_numpy(image)
         control = _image_batch_to_numpy(control_image) if control_image is not None else None
@@ -258,7 +263,7 @@ class DLSS5PyTorchEnhance:
                 f"got {tuple(control.shape[1:3])} vs {tuple(source.shape[1:3])}"
             )
         if control is not None and processing_scale != 1.0:
-            raise ValueError("MLX-DLSS control masks require processing_scale=1.0")
+            raise ValueError("DLSS 5 control masks require processing_scale=1.0")
 
         progress = None
         try:
@@ -299,7 +304,6 @@ class DLSS5PyTorchEnhance:
 
         stacked = np.stack(outputs, axis=0)
         out = torch.from_numpy(stacked).clamp_(0.0, 1.0)
-        # Preserve the normal ComfyUI IMAGE placement/dtype when practical.
         return (out.to(device=image.device, dtype=image.dtype),)
 
 

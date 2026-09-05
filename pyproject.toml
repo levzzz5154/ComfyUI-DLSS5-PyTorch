@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-dlss5-pytorch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Self-contained pure-PyTorch ComfyUI implementation of the recovered DLSS 5 Neural Rendering graph"
 requires-python = ">=3.10"
 dependencies = [

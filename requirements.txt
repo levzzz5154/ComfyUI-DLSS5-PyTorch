@@ -1,0 +1,3 @@
+numpy
+safetensors>=0.4
+mlxdlss @ git+https://github.com/iamwavecut/MLX-DLSS.git@771ccb3b3bc84477c99452b63b16cb724319a338#subdirectory=python

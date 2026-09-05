@@ -1,17 +1,17 @@
 [project]
 name = "comfyui-dlss5-pytorch"
-version = "0.1.0"
-description = "ComfyUI nodes for the reverse-engineered DLSS 5 Neural Rendering PyTorch model"
+version = "0.2.0"
+description = "Self-contained pure-PyTorch ComfyUI implementation of the recovered DLSS 5 Neural Rendering graph"
 requires-python = ">=3.10"
 dependencies = [
   "numpy",
+  "Pillow>=9",
   "safetensors>=0.4",
-  "mlxdlss @ git+https://github.com/iamwavecut/MLX-DLSS.git@771ccb3b3bc84477c99452b63b16cb724319a338#subdirectory=python",
 ]
 
 [project.urls]
 Repository = "https://github.com/levzzz5154/ComfyUI-DLSS5-PyTorch"
-Upstream = "https://github.com/iamwavecut/MLX-DLSS"
+Reference = "https://github.com/iamwavecut/MLX-DLSS"
 
 [tool.comfy]
 PublisherId = "levzzz5154"

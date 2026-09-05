@@ -1,8 +1,6 @@
-"""Dependency-light smoke tests for the ComfyUI wrapper.
+"""Dependency-light smoke test for the self-contained ComfyUI node.
 
 Run from the repository root with: python tests/smoke.py
-The MLX-DLSS network is mocked; this validates ComfyUI-facing plumbing without
-requiring proprietary weights or a full ComfyUI checkout.
 """
 from __future__ import annotations
 
@@ -14,7 +12,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -34,13 +31,12 @@ class FakeFolderPaths(types.ModuleType):
         out = []
         for base in paths:
             base = Path(base)
-            if not base.exists():
-                continue
-            out.extend(
-                str(p.relative_to(base)).replace("\\", "/")
-                for p in base.rglob("*")
-                if p.is_file()
-            )
+            if base.exists():
+                out.extend(
+                    str(p.relative_to(base)).replace("\\", "/")
+                    for p in base.rglob("*")
+                    if p.is_file()
+                )
         return sorted(out)
 
     def get_full_path(self, name, filename):
@@ -68,11 +64,12 @@ class FakePipeline:
 
     def enhance(self, image, **kwargs):
         self.calls.append(kwargs)
-        result = np.clip(np.asarray(image, dtype=np.float32) + 0.1, 0.0, 1.0)
-        return types.SimpleNamespace(image=result)
+        return types.SimpleNamespace(
+            image=np.clip(np.asarray(image, dtype=np.float32) + 0.1, 0.0, 1.0)
+        )
 
 
-def load_nodes(model_root: Path):
+def install_comfy_stubs(model_root: Path):
     fp = FakeFolderPaths(model_root)
     sys.modules["folder_paths"] = fp
 
@@ -90,32 +87,17 @@ def load_nodes(model_root: Path):
     comfy_utils.ProgressBar = ProgressBar
     sys.modules["comfy"] = comfy
     sys.modules["comfy.utils"] = comfy_utils
+    return fp
 
-    mlxdlss = types.ModuleType("mlxdlss")
-    pipeline = types.ModuleType("mlxdlss.pipeline")
-    pipeline.NeuralRenderingPipeline = FakePipeline
-    sys.modules["mlxdlss"] = mlxdlss
-    sys.modules["mlxdlss.pipeline"] = pipeline
 
-    # Load nodes.py directly for focused tests.
+def load_nodes(model_root: Path):
+    install_comfy_stubs(model_root)
     spec = importlib.util.spec_from_file_location("dlss5_nodes_smoke", REPO / "nodes.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-
-    # Also verify the package-style __init__.py load ComfyUI uses for custom nodes.
-    package_name = "dlss5_custom_node_smoke"
-    package_spec = importlib.util.spec_from_file_location(
-        package_name,
-        REPO / "__init__.py",
-        submodule_search_locations=[str(REPO)],
-    )
-    package = importlib.util.module_from_spec(package_spec)
-    assert package_spec.loader is not None
-    sys.modules[package_name] = package
-    package_spec.loader.exec_module(package)
-    assert "DLSS5PyTorchModelLoader" in package.NODE_CLASS_MAPPINGS
+    module._import_pipeline_class = lambda: FakePipeline
     return module
 
 
@@ -126,75 +108,142 @@ def make_model(nodes, name="model.safetensors"):
     return path
 
 
-def main() -> None:
+def assert_self_contained():
+    required = [
+        REPO / "dlss5" / "__init__.py",
+        REPO / "dlss5" / "model.py",
+        REPO / "dlss5" / "pipeline.py",
+        REPO / "dlss5" / "features.py",
+        REPO / "dlss5" / "composition.py",
+    ]
+    assert all(path.is_file() for path in required), "vendored PyTorch source is incomplete"
+
+    for path in REPO.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        compile(source, str(path), "exec")
+        assert "from mlxdlss" not in source
+        assert "import mlxdlss" not in source
+
+    dependency_text = (
+        (REPO / "requirements.txt").read_text(encoding="utf-8")
+        + (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    ).lower()
+    assert "mlxdlss" not in dependency_text
+    assert "git+https://github.com/iamwavecut/mlx-dlss" not in dependency_text
+
+    sys.path.insert(0, str(REPO))
+    try:
+        from dlss5.pipeline import NeuralRenderingPipeline
+
+        assert NeuralRenderingPipeline is not None
+    finally:
+        sys.path.pop(0)
+
+
+def main():
+    assert_self_contained()
+
     with tempfile.TemporaryDirectory() as td:
         nodes = load_nodes(Path(td) / "models")
         FakePipeline.loads.clear()
 
-        # Registration and extension filtering.
         make_model(nodes, "a.safetensors")
         (Path(nodes._MODEL_DIR) / "ignore.txt").write_text("x")
         assert nodes._model_names() == ["a.safetensors"]
 
-        # Cache behavior.
         loader = nodes.DLSS5PyTorchModelLoader()
         first = loader.load_model("a.safetensors", "fast", "auto")[0]
         second = loader.load_model("a.safetensors", "fast", "auto")[0]
         assert first is second
         assert len(FakePipeline.loads) == 1
 
-        # Batch conversion and frame-index sequencing.
         image = torch.zeros((2, 8, 9, 3), dtype=torch.float32)
         out = nodes.DLSS5PyTorchEnhance().enhance(
-            first, image, "standard", 1.0, 1.0, 1.0, 1.0, 4.0, 7,
-            "sequence (advance frame index)", False, 0, 1.0, 1.0,
+            first,
+            image,
+            "standard",
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            4.0,
+            7,
+            "sequence (advance frame index)",
+            False,
+            0,
+            1.0,
+            1.0,
         )[0]
         assert out.shape == image.shape
         assert torch.allclose(out, torch.full_like(out, 0.1))
         assert [c["frame_index"] for c in first.pipeline.calls[-2:]] == [7, 8]
 
-        # Custom control forwarding.
         nodes.DLSS5PyTorchEnhance().enhance(
-            first, image[:1], "natural", 1.0, 0.75, 0.5, 0.6, 3.0, 0,
-            "independent (same frame index)", True, 64, 1.25, 0.8,
+            first,
+            image[:1],
+            "natural",
+            1.0,
+            0.75,
+            0.5,
+            0.6,
+            3.0,
+            0,
+            "independent (same frame index)",
+            True,
+            64,
+            1.25,
+            0.8,
         )
         call = first.pipeline.calls[-1]
         assert abs(call["normalized_style"] - 0.5) < 1e-9
         assert abs(call["local_tone_strength"] - 1.25) < 1e-9
         assert abs(call["local_structure_strength"] - 0.8) < 1e-9
 
-        # Control-image broadcasting.
         control = torch.ones((1, 8, 9, 3))
         nodes.DLSS5PyTorchEnhance().enhance(
-            first, image, "standard", 1.0, 1.0, 1.0, 1.0, 4.0, 0,
-            "independent (same frame index)", False, 0, 1.0, 1.0, control,
+            first,
+            image,
+            "standard",
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            4.0,
+            0,
+            "independent (same frame index)",
+            False,
+            0,
+            1.0,
+            1.0,
+            control,
         )
         assert all(c["control_mask"].shape == (8, 9, 3) for c in first.pipeline.calls[-2:])
 
-        # Geometry validation should fail before upstream invocation.
         bad_control = torch.zeros((1, 7, 9, 3))
         try:
             nodes.DLSS5PyTorchEnhance().enhance(
-                first, image[:1], "standard", 1.0, 1.0, 1.0, 1.0, 4.0, 0,
-                "independent (same frame index)", False, 0, 1.0, 1.0, bad_control,
+                first,
+                image[:1],
+                "standard",
+                1.0,
+                1.0,
+                1.0,
+                1.0,
+                4.0,
+                0,
+                "independent (same frame index)",
+                False,
+                0,
+                1.0,
+                1.0,
+                bad_control,
             )
         except ValueError as exc:
             assert "height/width" in str(exc)
         else:
             raise AssertionError("mismatched control geometry was accepted")
 
-        # Control masks must stay at processing scale 1.0 in current upstream.
-        try:
-            nodes.DLSS5PyTorchEnhance().enhance(
-                first, image[:1], "standard", 2.0, 1.0, 1.0, 1.0, 4.0, 0,
-                "independent (same frame index)", False, 0, 1.0, 1.0, control,
-            )
-        except ValueError as exc:
-            assert "processing_scale=1.0" in str(exc)
-        else:
-            raise AssertionError("control mask with processing_scale != 1 was accepted")
-
-    print("smoke tests: PASS")
+    print("smoke tests: PASS (self-contained pure-PyTorch runtime)")
 
 
 if __name__ == "__main__":

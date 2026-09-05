@@ -1,27 +1,48 @@
 # ComfyUI-DLSS5-PyTorch
 
-Experimental ComfyUI nodes for running the reverse-engineered **DLSS 5 Neural Rendering** model from [iamwavecut/MLX-DLSS](https://github.com/iamwavecut/MLX-DLSS) directly through its PyTorch implementation.
+A **self-contained pure-PyTorch ComfyUI implementation** of the recovered DLSS 5 Neural Rendering network.
 
-This project is intentionally different from existing DLSS 5 ComfyUI integrations that call NVIDIA NGX through D3D12/VapourSynth. It does **not** call `nvngx_dlssnr.dll` during inference. Instead, it loads MLX-DLSS **fully-logical safetensors** and executes the recovered transformer graph in PyTorch.
+The reverse-engineering work this implementation is based on comes from [iamwavecut/MLX-DLSS](https://github.com/iamwavecut/MLX-DLSS). The required PyTorch model/runtime code is included directly in this repository as ordinary Python source under `dlss5/`.
 
-> Experimental / research software. This is not affiliated with or endorsed by NVIDIA, Comfy Org, or the MLX-DLSS authors.
+## What “self-contained” means here
 
-## Why this exists
+This repository does **not** depend on the `mlxdlss` Python package and does not download MLX-DLSS at install or runtime.
 
-- Direct PyTorch execution of the recovered model.
-- CUDA/Linux should be possible because inference is not tied to D3D12/NGX.
-- Useful baseline before trying custom FP8/INT8/CUTLASS kernels.
-- Keeps the ComfyUI wrapper small by depending on upstream `mlxdlss` rather than copying the recovered model code.
+It also does **not** use or bundle:
 
-## Current status
+- `nvngx_dlssnr.dll`
+- NVIDIA NGX
+- D3D12 runtime bridges
+- VapourSynth/VapourKit
+- custom `.so` / `.dll` native extensions
+- precompiled CUDA binaries
+- opaque executable blobs
 
-v0.1 supports **first-frame / still-image inference** and IMAGE batches.
+The inference implementation is visible Python/PyTorch source:
 
-MLX-DLSS also contains a separate recovered `TemporalSession` with display-history reprojection, motion input/optical-flow support, and the learned temporal blend. **This node does not expose that temporal API yet**; its batch sequence mode only advances the deterministic noise frame index. Therefore v0.1 should be treated as still-image/batch neural-rendering inference, not full temporal DLSS 5 parity.
+```text
+ComfyUI-DLSS5-PyTorch/
+├── __init__.py
+├── nodes.py
+└── dlss5/
+    ├── __init__.py
+    ├── model.py
+    ├── pipeline.py
+    ├── features.py
+    └── composition.py
+```
+
+The only thing not bundled is the **model weight data**. You still need a compatible fully-logical DLSS 5 `.safetensors` file; proprietary model weights are not redistributed here.
+
+## Architecture/runtime
+
+`dlss5/model.py` contains the recovered 71-block transformer graph in PyTorch, including the E4M3 publication emulation, custom polynomial gate, cosine attention, shifted 8×8 windows, global bottleneck attention, hierarchical pooling/upsampling, and output head.
+
+`dlss5/features.py` builds the recovered 16-channel first-frame input features. `dlss5/composition.py` performs output composition/resampling. `dlss5/pipeline.py` ties weight loading, preprocessing, PyTorch inference, and postprocessing together.
+
+There is no hidden runtime behind the ComfyUI node.
 
 ## Installation
-
-Clone into `ComfyUI/custom_nodes`:
 
 ```bash
 cd ComfyUI/custom_nodes
@@ -32,104 +53,87 @@ pip install -r requirements.txt
 
 Restart ComfyUI.
 
-The dependency is pinned to a known MLX-DLSS commit for API stability.
+The requirements are only normal Python libraries used by the implementation:
+
+```text
+numpy
+Pillow
+safetensors
+```
+
+PyTorch itself is supplied by ComfyUI.
 
 ## Weights
 
-This node does not redistribute NVIDIA model weights or runtime binaries.
-
-It expects the **fully-logical safetensors** format accepted by MLX-DLSS (`dlssnr-logical-v8` through the formats supported by the pinned upstream package, with `fully_logical=true`).
-
-Put the file in:
+Place a compatible **fully-logical** DLSS 5 safetensors file in:
 
 ```text
 ComfyUI/models/dlss5/
 ```
 
-Then choose it in **DLSS 5 PyTorch Model Loader**.
+The loader currently accepts recovered logical formats `dlssnr-logical-v8` through `dlssnr-logical-v18` with metadata `fully_logical=true`.
 
-Use the MLX-DLSS weight tooling to produce the logical safetensors from a source you are legally permitted to use. See upstream documentation for the current extraction workflow.
+No weights are included in this repository.
 
 ## Nodes
 
 ### DLSS 5 PyTorch Model Loader
 
-Loads and caches one logical model.
+Loads the logical safetensors directly into the local PyTorch implementation.
 
-- **precision = fast**: upstream FP16 path on GPU while preserving the recovered E4M3 publication behavior.
-- **precision = reference**: upstream float32/reference path; much slower and intended for correctness comparisons.
-- **device = auto**: CUDA first, then MPS, then CPU according to MLX-DLSS.
+- `fast`: float16 model execution on GPU while preserving recovered E4M3 publication points.
+- `reference`: float32/reference execution.
+- `auto`: CUDA first, then MPS, then CPU.
 
 ### DLSS 5 PyTorch Neural Rendering
 
-Inputs:
+Takes a normal ComfyUI `IMAGE` and exposes:
 
-- ComfyUI `IMAGE` (single image or batch)
-- profile: `standard`, `natural`, `cinematic`, `neutral`
-- processing scale: 1.0–4.0
+- profile: standard / natural / cinematic / neutral
+- processing scale
 - intensity
-- detail / colour strengths and detail radius
-- deterministic noise frame index
-- optional custom style/tone/structure controls
+- detail strength
+- colour strength
+- detail radius
+- deterministic frame index
+- custom style/tone/structure controls
 - optional RGB control image
+- image batches
 
-The upstream control-image channel semantics are:
-
-- R: final blend strength
-- G: local tone strength
-- B: local structure strength
-
-When a control image is supplied, upstream currently requires `processing_scale = 1.0`.
+`sequence (advance frame index)` only advances deterministic noise across a batch; it is not full temporal accumulation yet.
 
 ### DLSS 5 PyTorch Clear Cache
 
-Releases the cached model and asks PyTorch to empty CUDA cache.
+Releases the cached model and empties the CUDA cache when available.
 
-## Batch behavior
+## Current limitations
 
-`independent (same frame index)` uses the same deterministic noise index for every image in the batch.
+This is a correctness-first PyTorch implementation, not NVIDIA's fused production runtime. It is expected to be much slower than native DLSS 5 until the expensive operations are replaced with optimized kernels.
 
-`sequence (advance frame index)` increments the noise frame index across the batch. This is **not temporal accumulation**. Upstream MLX-DLSS has a separate `TemporalSession`; exposing that stateful path in ComfyUI is future work here.
+v0.2 currently exposes the first-frame/still-image path. Temporal history + motion-vector inference is planned separately.
 
-## Performance notes
+## Why not use the native DLL?
 
-This is the reference PyTorch implementation, not NVIDIA's fused runtime. Expect it to be substantially slower than native DLSS 5. The point of this node is to establish a correct, inspectable ComfyUI baseline first.
+There are already ComfyUI projects wrapping the native NVIDIA runtime. This project has a different goal: make the recovered model graph directly inspectable and modifiable in PyTorch so it can later serve as the baseline for CUDA/FP8/INT8 work.
 
-The MLX-DLSS project has already added bounded/chunked PyTorch evaluation to reduce activation memory. Future work here can target native FP8 and then INT8 Tensor Core kernels without changing the ComfyUI-facing workflow.
+## Credits
 
-## Existing DLSS 5 ComfyUI projects
+The architecture recovery, tensor layouts, feature reconstruction, and reference implementation this project is derived from were produced by the **MLX-DLSS contributors**:
 
-Other projects already integrate DLSS 5 by driving native/runtime paths, including:
+https://github.com/iamwavecut/MLX-DLSS
 
-- `lisitskyaa/ComfyUI-DLSS5-NR` — in-process D3D12/NGX bridge.
-- `Blueforcer/ComfyUI-DLSS5-Enhancer` — native worker / runtime integration, including video tooling.
-- `HECer/ComfyUI-DLSS5` — VapourSynth/VapourKit-based runtime path.
+Vendored/adapted portions retain the upstream Apache-2.0 licensing requirements. See `THIRD_PARTY_NOTICES.md` and `licenses/MLX-DLSS-APACHE-2.0.txt`.
 
-This repository's niche is specifically **recovered PyTorch model inference**.
-
-## Roadmap
-
-- [x] Load fully-logical MLX-DLSS safetensors
-- [x] Still-image inference
-- [x] IMAGE batches
-- [x] ComfyUI model-folder integration
-- [x] Optional RGB control image
-- [ ] Expose upstream `TemporalSession` (history + motion-vector/optical-flow path)
-- [ ] CUDA-only path that avoids CPU/NumPy staging
-- [ ] Native FP8 kernels
-- [ ] Experimental INT8 W8A8 backend
-- [ ] ComfyUI Registry metadata / packaged release
+This project is not affiliated with or endorsed by NVIDIA, Comfy Org, or the MLX-DLSS contributors.
 
 ## Development check
-
-The repository includes a small smoke test that mocks ComfyUI and the heavy MLX-DLSS network while exercising model discovery, loader caching, IMAGE batches, frame-index sequencing, custom controls, and control-mask validation:
 
 ```bash
 python tests/smoke.py
 ```
 
-It does not replace an end-to-end inference test with real logical weights on a ComfyUI installation.
+The smoke test checks the ComfyUI-facing plumbing and explicitly verifies that the repository has no `mlxdlss` package dependency/import.
 
 ## License
 
-This ComfyUI wrapper is MIT licensed. MLX-DLSS is a separate project under its own license. NVIDIA software, model weights, trademarks, and proprietary binaries are not included in this repository and are governed by their respective terms.
+The original ComfyUI wrapper code in this repository is MIT licensed. Code derived from MLX-DLSS remains subject to Apache License 2.0; see the included third-party notices and license copy.

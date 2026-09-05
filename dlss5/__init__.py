@@ -5,5 +5,13 @@ adapted to live directly in this repository. See THIRD_PARTY_NOTICES.md.
 """
 
 from .pipeline import EnhanceResult, NeuralRenderingPipeline, NeuralRenderingSession
+from .temporal import BLEND_SCALE, make_temporal_features, normalize_pixel_motion
 
-__all__ = ["EnhanceResult", "NeuralRenderingPipeline", "NeuralRenderingSession"]
+__all__ = [
+    "EnhanceResult",
+    "NeuralRenderingPipeline",
+    "NeuralRenderingSession",
+    "BLEND_SCALE",
+    "make_temporal_features",
+    "normalize_pixel_motion",
+]

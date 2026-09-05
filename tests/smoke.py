@@ -1,4 +1,4 @@
-"""Dependency-light smoke test for the self-contained ComfyUI node.
+"""Dependency-light smoke test for the self-contained ComfyUI nodes.
 
 Run from the repository root with: python tests/smoke.py
 """
@@ -8,6 +8,7 @@ import importlib.util
 import sys
 import tempfile
 import types
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -56,6 +57,7 @@ class FakePipeline:
         self.device = torch.device("cpu")
         self.precision = precision
         self.calls = []
+        self.feature_calls = []
 
     @classmethod
     def from_safetensors(cls, model_path, *, device="auto", precision="reference"):
@@ -67,6 +69,11 @@ class FakePipeline:
         return types.SimpleNamespace(
             image=np.clip(np.asarray(image, dtype=np.float32) + 0.1, 0.0, 1.0)
         )
+
+    def run_features(self, features):
+        features = np.asarray(features, dtype=np.float32)
+        self.feature_calls.append(features)
+        return np.zeros((*features.shape[:2], 4), dtype=np.float32)
 
 
 def install_comfy_stubs(model_root: Path):
@@ -108,6 +115,103 @@ def make_model(nodes, name="model.safetensors"):
     return path
 
 
+@dataclass(frozen=True)
+class FakeAutomaticMask:
+    skin_structure_strength: float
+    automatic_mask_structure_strength: float
+
+
+class FakeGeometry:
+    def __init__(self, width, height):
+        self.network_width = width
+        self.network_height = height
+
+    @classmethod
+    def vendor_aligned(cls, width, height):
+        return cls(width, height)
+
+    def crop(self, array):
+        return array
+
+
+def make_fake_runtime(captured_motion: list[np.ndarray]):
+    profiles = {
+        "standard": {
+            "normalized_style": 0.0,
+            "local_tone_strength": 1.0,
+            "local_structure_strength": 1.0,
+        },
+        "natural": {
+            "normalized_style": 1.0 / 128.0,
+            "local_tone_strength": 1.0,
+            "local_structure_strength": 1.0,
+        },
+        "cinematic": {
+            "normalized_style": 2.0 / 128.0,
+            "local_tone_strength": 1.0,
+            "local_structure_strength": 1.0,
+        },
+        "neutral": {
+            "normalized_style": 0.0,
+            "local_tone_strength": 0.0,
+            "local_structure_strength": 0.0,
+        },
+    }
+
+    def make_features(color, **kwargs):
+        del kwargs
+        h, w = color.shape[:2]
+        return np.zeros((h, w, 16), dtype=np.float32)
+
+    def compose_head(head, color, **kwargs):
+        del head, kwargs
+        return np.clip(color + 0.1, 0, 1).astype(np.float32)
+
+    def compose_detail(source, output, **kwargs):
+        del source, kwargs
+        return np.asarray(output, dtype=np.float32)
+
+    def normalize_pixel_motion(motion, **kwargs):
+        width = kwargs["effective_width"]
+        height = kwargs["effective_height"]
+        out = np.empty_like(motion, dtype=np.float32)
+        out[..., 0] = (
+            motion[..., 0] * kwargs["scale_x"] + kwargs["jitter_dx"]
+        ) / width
+        out[..., 1] = (
+            motion[..., 1] * kwargs["scale_y"] + kwargs["jitter_dy"]
+        ) / height
+        return out
+
+    def make_temporal_features(color, history, motion, **kwargs):
+        del history, kwargs
+        captured_motion.append(np.asarray(motion).copy())
+        h, w = color.shape[:2]
+        return np.zeros((h, w, 16), dtype=np.float32)
+
+    def extend_features(features, geometry, frame_index):
+        del geometry, frame_index
+        return features
+
+    def compose_temporal(head, color, features, **kwargs):
+        del head, features, kwargs
+        return np.clip(color + 0.2, 0, 1).astype(np.float32)
+
+    return {
+        "AutomaticMask": FakeAutomaticMask,
+        "NetworkGeometry": FakeGeometry,
+        "PROFILES": profiles,
+        "make_features": make_features,
+        "compose_head": compose_head,
+        "compose_detail": compose_detail,
+        "BLEND_SCALE": 0.73974609375,
+        "compose_temporal": compose_temporal,
+        "extend_features": extend_features,
+        "make_temporal_features": make_temporal_features,
+        "normalize_pixel_motion": normalize_pixel_motion,
+    }
+
+
 def assert_self_contained():
     required = [
         REPO / "dlss5" / "__init__.py",
@@ -115,8 +219,9 @@ def assert_self_contained():
         REPO / "dlss5" / "pipeline.py",
         REPO / "dlss5" / "features.py",
         REPO / "dlss5" / "composition.py",
+        REPO / "dlss5" / "temporal.py",
     ]
-    assert all(path.is_file() for path in required), "vendored PyTorch source is incomplete"
+    assert all(path.is_file() for path in required), "self-contained runtime is incomplete"
 
     for path in REPO.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
@@ -134,8 +239,19 @@ def assert_self_contained():
     sys.path.insert(0, str(REPO))
     try:
         from dlss5.pipeline import NeuralRenderingPipeline
+        from dlss5.temporal import normalize_pixel_motion
 
         assert NeuralRenderingPipeline is not None
+        motion = np.ones((2, 4, 2), dtype=np.float32)
+        normalized = normalize_pixel_motion(
+            motion,
+            scale_x=1,
+            scale_y=-1,
+            effective_width=4,
+            effective_height=2,
+        )
+        assert np.allclose(normalized[..., 0], 0.25)
+        assert np.allclose(normalized[..., 1], -0.5)
     finally:
         sys.path.pop(0)
 
@@ -146,10 +262,16 @@ def main():
     with tempfile.TemporaryDirectory() as td:
         nodes = load_nodes(Path(td) / "models")
         FakePipeline.loads.clear()
+        captured_motion: list[np.ndarray] = []
+        fake_runtime = make_fake_runtime(captured_motion)
+        nodes._import_render_runtime = lambda: fake_runtime
 
         make_model(nodes, "a.safetensors")
         (Path(nodes._MODEL_DIR) / "ignore.txt").write_text("x")
         assert nodes._model_names() == ["a.safetensors"]
+
+        assert "DLSS5PyTorchEnhance" in nodes.NODE_CLASS_MAPPINGS
+        assert "DLSS5PyTorchVideoEnhance" in nodes.NODE_CLASS_MAPPINGS
 
         loader = nodes.DLSS5PyTorchModelLoader()
         first = loader.load_model("a.safetensors", "fast", "auto")[0]
@@ -158,7 +280,7 @@ def main():
         assert len(FakePipeline.loads) == 1
 
         image = torch.zeros((2, 8, 9, 3), dtype=torch.float32)
-        out = nodes.DLSS5PyTorchEnhance().enhance(
+        still = nodes.DLSS5PyTorchEnhance().enhance(
             first,
             image,
             "standard",
@@ -168,38 +290,24 @@ def main():
             1.0,
             4.0,
             7,
-            "sequence (advance frame index)",
-            False,
-            0,
-            1.0,
-            1.0,
-        )[0]
-        assert out.shape == image.shape
-        assert torch.allclose(out, torch.full_like(out, 0.1))
-        assert [c["frame_index"] for c in first.pipeline.calls[-2:]] == [7, 8]
-
-        nodes.DLSS5PyTorchEnhance().enhance(
-            first,
-            image[:1],
-            "natural",
-            1.0,
-            0.75,
-            0.5,
-            0.6,
-            3.0,
-            0,
-            "independent (same frame index)",
             True,
             64,
             1.25,
             0.8,
-        )
-        call = first.pipeline.calls[-1]
-        assert abs(call["normalized_style"] - 0.5) < 1e-9
-        assert abs(call["local_tone_strength"] - 1.25) < 1e-9
-        assert abs(call["local_structure_strength"] - 0.8) < 1e-9
+            True,
+            -1.0,
+            0.5,
+            "sequence (advance frame index)",
+        )[0]
+        assert still.shape == image.shape
+        assert torch.allclose(still, torch.full_like(still, 0.1))
+        calls = first.pipeline.calls[-2:]
+        assert [c["frame_index"] for c in calls] == [7, 8]
+        assert abs(calls[0]["normalized_style"] - 0.5) < 1e-9
+        assert abs(calls[0]["local_tone_strength"] - 1.25) < 1e-9
+        assert calls[0]["automatic_mask"].automatic_mask_structure_strength == 0.5
 
-        control = torch.ones((1, 8, 9, 3))
+        control = torch.ones((1, 8, 9, 3), dtype=torch.float32)
         nodes.DLSS5PyTorchEnhance().enhance(
             first,
             image,
@@ -210,20 +318,65 @@ def main():
             1.0,
             4.0,
             0,
-            "independent (same frame index)",
             False,
             0,
             1.0,
             1.0,
+            False,
+            -1.0,
+            -1.0,
+            "independent (same frame index)",
             control,
         )
         assert all(c["control_mask"].shape == (8, 9, 3) for c in first.pipeline.calls[-2:])
 
-        bad_control = torch.zeros((1, 7, 9, 3))
+        video = torch.zeros((3, 8, 9, 3), dtype=torch.float32)
+        # Two transition fields: frame 1->0 and frame 2->1, each +2 px X.
+        motion = torch.zeros((2, 8, 9, 3), dtype=torch.float32)
+        motion[..., 0] = 2.0
+        video_out = nodes.DLSS5PyTorchVideoEnhance().enhance_video(
+            first,
+            video,
+            motion,
+            "standard",
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            4.0,
+            0,
+            False,
+            0,
+            1.0,
+            1.0,
+            False,
+            -1.0,
+            -1.0,
+            "pixel",
+            "signed RG",
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            0.0,
+            0.73974609375,
+            "observed (matches DLL)",
+            False,
+            0.0,
+        )[0]
+        assert video_out.shape == video.shape
+        assert torch.allclose(video_out[0], torch.full_like(video_out[0], 0.1))
+        assert torch.allclose(video_out[1:], torch.full_like(video_out[1:], 0.2))
+        assert len(captured_motion) == 2
+        assert np.allclose(captured_motion[0][..., 0], 2.0 / 9.0)
+        assert np.allclose(captured_motion[0][..., 1], 0.0)
+
+        bad_motion = torch.zeros((2, 7, 9, 3), dtype=torch.float32)
         try:
-            nodes.DLSS5PyTorchEnhance().enhance(
+            nodes.DLSS5PyTorchVideoEnhance().enhance_video(
                 first,
-                image[:1],
+                video,
+                bad_motion,
                 "standard",
                 1.0,
                 1.0,
@@ -231,19 +384,31 @@ def main():
                 1.0,
                 4.0,
                 0,
-                "independent (same frame index)",
                 False,
                 0,
                 1.0,
                 1.0,
-                bad_control,
+                False,
+                -1.0,
+                -1.0,
+                "pixel",
+                "signed RG",
+                1.0,
+                1.0,
+                1.0,
+                0.0,
+                0.0,
+                0.73974609375,
+                "observed (matches DLL)",
+                False,
+                0.0,
             )
         except ValueError as exc:
             assert "height/width" in str(exc)
         else:
-            raise AssertionError("mismatched control geometry was accepted")
+            raise AssertionError("mismatched motion geometry was accepted")
 
-    print("smoke tests: PASS (self-contained pure-PyTorch runtime)")
+    print("smoke tests: PASS (still + temporal video, self-contained pure-PyTorch runtime)")
 
 
 if __name__ == "__main__":

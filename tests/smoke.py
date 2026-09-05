@@ -4,6 +4,7 @@ Run from the repository root with: python tests/smoke.py
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import sys
 import tempfile
@@ -58,22 +59,23 @@ class FakePipeline:
         self.precision = precision
         self.calls = []
         self.feature_calls = []
+        self.model = torch.nn.Linear(1, 1)
 
     @classmethod
-    def from_safetensors(cls, model_path, *, device="auto", precision="reference"):
+    def from_safetensors(cls, model_path, *, device="auto", precision="reference", offload_device=None):
         cls.loads.append((str(model_path), device, precision))
         return cls(str(model_path), device, precision)
 
-    def enhance(self, image, **kwargs):
+    def enhance_tensor(self, image, **kwargs):
         self.calls.append(kwargs)
-        return types.SimpleNamespace(
-            image=np.clip(np.asarray(image, dtype=np.float32) + 0.1, 0.0, 1.0)
-        )
+        return (image.float() + 0.1).clamp(0, 1)
 
-    def run_features(self, features):
-        features = np.asarray(features, dtype=np.float32)
+    def run_features_tensor(self, features):
         self.feature_calls.append(features)
-        return np.zeros((*features.shape[:2], 4), dtype=np.float32)
+        return features.new_zeros((*features.shape[:2], 4))
+
+    def noise_tables(self):
+        return None
 
 
 def install_comfy_stubs(model_root: Path):
@@ -92,6 +94,16 @@ def install_comfy_stubs(model_root: Path):
             self.value += amount
 
     comfy_utils.ProgressBar = ProgressBar
+    management = types.ModuleType("comfy.model_management")
+    management.get_torch_device = lambda: torch.device("cpu")
+    management.intermediate_device = lambda: torch.device("cpu")
+    management.intermediate_dtype = lambda: torch.float32
+    management.module_size = lambda model: 4
+    management.free_memory = lambda memory, device: None
+    management.soft_empty_cache = lambda: None
+    management.throw_exception_if_processing_interrupted = lambda: None
+    comfy.model_management = management
+    sys.modules["comfy.model_management"] = management
     sys.modules["comfy"] = comfy
     sys.modules["comfy.utils"] = comfy_utils
     return fp
@@ -161,20 +173,20 @@ def make_fake_runtime(captured_motion: list[np.ndarray]):
     def make_features(color, **kwargs):
         del kwargs
         h, w = color.shape[:2]
-        return np.zeros((h, w, 16), dtype=np.float32)
+        return color.new_zeros((h, w, 16))
 
     def compose_head(head, color, **kwargs):
         del head, kwargs
-        return np.clip(color + 0.1, 0, 1).astype(np.float32)
+        return (color + 0.1).clamp(0, 1)
 
     def compose_detail(source, output, **kwargs):
         del source, kwargs
-        return np.asarray(output, dtype=np.float32)
+        return output.float()
 
     def normalize_pixel_motion(motion, **kwargs):
         width = kwargs["effective_width"]
         height = kwargs["effective_height"]
-        out = np.empty_like(motion, dtype=np.float32)
+        out = torch.empty_like(motion)
         out[..., 0] = (
             motion[..., 0] * kwargs["scale_x"] + kwargs["jitter_dx"]
         ) / width
@@ -185,9 +197,9 @@ def make_fake_runtime(captured_motion: list[np.ndarray]):
 
     def make_temporal_features(color, history, motion, **kwargs):
         del history, kwargs
-        captured_motion.append(np.asarray(motion).copy())
+        captured_motion.append(motion.cpu().numpy().copy())
         h, w = color.shape[:2]
-        return np.zeros((h, w, 16), dtype=np.float32)
+        return color.new_zeros((h, w, 16))
 
     def extend_features(features, geometry, frame_index):
         del geometry, frame_index
@@ -195,7 +207,7 @@ def make_fake_runtime(captured_motion: list[np.ndarray]):
 
     def compose_temporal(head, color, features, **kwargs):
         del head, features, kwargs
-        return np.clip(color + 0.2, 0, 1).astype(np.float32)
+        return (color + 0.2).clamp(0, 1)
 
     return {
         "AutomaticMask": FakeAutomaticMask,
@@ -226,8 +238,11 @@ def assert_self_contained():
     for path in REPO.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
         compile(source, str(path), "exec")
-        assert "from mlxdlss" not in source
-        assert "import mlxdlss" not in source
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                assert all(alias.name.split(".")[0] != "mlxdlss" for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                assert (node.module or "").split(".")[0] != "mlxdlss"
 
     dependency_text = (
         (REPO / "requirements.txt").read_text(encoding="utf-8")

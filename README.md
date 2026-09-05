@@ -1,12 +1,14 @@
 # ComfyUI-DLSS5-PyTorch
 
-A **self-contained pure-PyTorch ComfyUI implementation** of the recovered DLSS 5 Neural Rendering network.
+A **self-contained ComfyUI implementation with a GPU-resident PyTorch rendering pipeline** of the recovered DLSS 5 Neural Rendering network.
 
 The reverse-engineering work this implementation is based on comes from [iamwavecut/MLX-DLSS](https://github.com/iamwavecut/MLX-DLSS). The required model/runtime code is included directly in this repository as ordinary Python source under `dlss5/`.
 
 ## What “self-contained” means here
 
 This repository does **not** depend on the `mlxdlss` Python package and does not download MLX-DLSS at install or runtime.
+
+Self-contained refers to the bundled implementation, not to having zero library dependencies. The ComfyUI rendering path uses PyTorch for the transformer, preprocessing, motion reprojection, composition, and resizing. NumPy initializes immutable reference lookup tables once and supports the retained reference API; Pillow is used only by that reference API. Checkpoint loading uses safetensors. The nodes require ComfyUI, and model weights must be supplied separately.
 
 It also does **not** use or bundle:
 
@@ -30,16 +32,22 @@ ComfyUI-DLSS5-PyTorch/
     ├── pipeline.py
     ├── features.py
     ├── temporal.py
-    └── composition.py
+    ├── composition.py
+    ├── tensor_ops.py
+    └── weight_spec.json
 ```
 
-The only thing not bundled is the **model weight data**. You still need a compatible fully-logical DLSS 5 `.safetensors` file; proprietary model weights are not redistributed here.
+The **model weight data** is not bundled. You need the libraries listed below and a compatible fully-logical DLSS 5 `.safetensors` file; proprietary model weights are not redistributed here.
 
 ## Architecture/runtime
 
 `dlss5/model.py` contains the recovered 71-block transformer graph in PyTorch, including E4M3 publication emulation, the custom polynomial gate, cosine attention, shifted 8×8 windows, global bottleneck attention, hierarchical pooling/upsampling, and the four-channel output head.
 
-`dlss5/features.py` builds the recovered 16-channel first-frame input. `dlss5/temporal.py` implements motion reprojection, five-tap history reconstruction, the optional recovered closest-depth guide, and learned temporal composition. `dlss5/composition.py` handles display composition/resampling. `dlss5/pipeline.py` ties weight loading and still-image inference together.
+`dlss5/tensor_ops.py` implements device-resident deterministic noise, 16-channel feature construction, five-tap history reconstruction, closest-depth motion guidance, learned temporal composition, separable detail filtering, and Lanczos resizing. `dlss5/pipeline.py` exposes `enhance_tensor` and `run_features_tensor`; the ComfyUI nodes use these tensor APIs.
+
+The NumPy implementations in `features.py`, `temporal.py`, and `composition.py`, plus the NumPy pipeline API, remain available for reference comparisons. They are not used for per-frame image processing by the nodes.
+
+Transformer optimizations batch the independent feed-forward heads/branches into GEMMs, vectorize cosine normalization while preserving its half-rounding reduction tree, use native PyTorch float8 conversion for E4M3 publication on CUDA, and cache recovered attention-bias layouts. The custom softmax is preserved; substituting standard softmax/Flash Attention would change the recovered network.
 
 There is no hidden runtime behind the ComfyUI nodes.
 
@@ -86,7 +94,13 @@ Loads the logical safetensors directly into the local PyTorch implementation.
 
 - `fast`: float16 model execution on GPU while preserving recovered E4M3 publication points.
 - `reference`: float32/reference execution.
-- `auto`: CUDA first, then MPS, then CPU.
+- `auto`: follows ComfyUI's selected device, including its CPU mode.
+
+The loader validates all required tensor names and shapes against the bundled reference specification. Weights stay on CPU between renders. Before rendering, the node requests memory through ComfyUI, moves the model to the selected device, and offloads it to CPU on completion or failure. Cancellation is checked between frames and transformer blocks. Output placement and dtype follow ComfyUI's intermediate tensor settings.
+
+During a render, each input frame is transferred to the selected device once. Features, model heads, control/motion/depth processing, and video history remain there. Only the finished image is copied to ComfyUI's intermediate device. Enabling scene-cut detection adds one scalar synchronization per transition for the reset decision.
+
+To preserve the original deterministic noise despite CPU/GPU transcendental rounding differences, the first tensor render initializes approximately 192 MiB of lookup constants (plus a 256 KiB temporal sigmoid table). They contain no model weights or image data. All per-frame lookups and noise arithmetic run on the rendering device; the tables offload with the model. Initialization is a one-time cost per model handle.
 
 ### DLSS 5 PyTorch Neural Rendering
 
@@ -97,7 +111,7 @@ Inputs include:
 - current `IMAGE`
 - profile: standard / natural / cinematic / neutral
 - processing scale
-- intensity
+- intensity (0–1 final effect blend; 1 applies the full effect)
 - detail strength / colour strength / detail radius
 - deterministic frame index
 - custom style index
@@ -168,7 +182,7 @@ Temporal mode currently requires `processing_scale = 1.0`.
 
 ### DLSS 5 PyTorch Clear Cache
 
-Releases the cached model and empties the CUDA cache when available.
+Clears this extension's model lookup cache, offloads live model handles to CPU, and asks ComfyUI to release unused device allocations. It runs every time it is queued with `clear=true`. ComfyUI may retain CPU weights in cached loader outputs; this node does not invalidate the entire workflow cache. It has no dependency link to the render nodes, so use a separate queue execution when ordering matters.
 
 ## What is *not* a runtime input
 
@@ -193,9 +207,29 @@ Motion and the optional depth guide are preprocessing inputs used to construct c
 
 ## Current limitations
 
-This is a correctness-first PyTorch implementation, not NVIDIA's fused production runtime. It is expected to be much slower than native DLSS 5 until expensive operations are replaced with optimized CUDA/FP8/INT8 kernels.
+The CUDA rendering path is GPU-resident and optimized, but it is not NVIDIA's fused production runtime. It uses ordinary PyTorch operations, without a custom CUDA extension or a mandatory compilation step. It does not promise real-time full-HD rendering. CPU remains supported; MPS uses float32 resampling/coordinate arithmetic because Metal does not support float64, so exact CUDA/reference parity is not claimed there.
 
 The video node currently expects motion fields to be supplied by the workflow; it does not generate optical flow itself.
+
+## Measured performance
+
+RTX 4070 SUPER (12 GiB), PyTorch 2.10.0+cu130, `fast` precision, processing scale 1, deterministic synthetic RGB input, detail strength 1.2 and colour strength 0.8. Medians of three warmed runs include frame input/output transfers. Model loading, first-use lookup initialization, and ComfyUI's between-node weight transfers are excluded.
+
+| Image size | Previous pipeline | Tensor pipeline | Speedup | Peak allocated VRAM |
+| --- | ---: | ---: | ---: | ---: |
+| 320 × 320 | 520 ms | 74 ms | 7.0× | 730 MiB |
+| 640 × 360 | 603 ms | 106 ms | 5.7× | 1,071 MiB |
+| 1920 × 1080 | 2,253 ms | 884 ms | 2.5× | 1,733 MiB |
+
+Maximum output difference from the prior pipeline was `1.2e-7` for these runs. A three-frame 320 × 320 video with fractional pixel motion matched exactly through the actual ComfyUI nodes. These measurements describe the tested checkpoint and inputs, not a guarantee for every device or workflow.
+
+Reproduce a warmed tensor benchmark with your own checkpoint:
+
+```bash
+python tools/benchmark.py --weights /path/to/logical.safetensors --backend tensor --width 1920 --height 1080 --output /tmp/dlss5-benchmark
+```
+
+The benchmark accepts `--runtime-root` to compare another checkout, `--backend numpy` for its original API, and `--compare /path/to/output.npy` to report numerical differences. It records JSON metrics and the output array.
 
 ## Why not use the native DLL?
 
@@ -215,9 +249,14 @@ This project is not affiliated with or endorsed by NVIDIA, Comfy Org, or the MLX
 
 ```bash
 python tests/smoke.py
+python tests/regression.py
+python tests/tensor.py
+python tests/tensor.py --device cuda
 ```
 
 The smoke test checks both still and temporal node plumbing and explicitly verifies that the repository has no `mlxdlss` package dependency/import.
+The regression tests cover checkpoint validation, offloading after failures, cache invalidation, intensity limits, and cancellation. They require no model weights or GPU.
+The tensor suite compares noise, masks, padding, resampling, detail composition, depth guidance, temporal history, and motion normalization against the NumPy/Pillow reference. CUDA tests require GPU access. `tools/validate_nodes.py` exercises the installed ComfyUI nodes and checks a short video against a preserved reference checkout; it requires a real checkpoint.
 
 ## License
 

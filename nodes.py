@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import gc
 import os
+import weakref
 from dataclasses import dataclass
+from functools import wraps
+from inspect import signature
+from itertools import chain
 from pathlib import Path
+from threading import RLock
 from typing import Any
 
-import numpy as np
 import torch
 
 import folder_paths
+from comfy import model_management
 
 
 CATEGORY = "DLSS 5/PyTorch (experimental)"
@@ -30,7 +35,7 @@ except Exception:
         )
 
 
-@dataclass
+@dataclass(eq=False)
 class DLSS5ModelHandle:
     pipeline: Any
     model_path: str
@@ -39,6 +44,8 @@ class DLSS5ModelHandle:
 
 
 _PIPELINE_CACHE: dict[tuple[str, int, int, str, str], DLSS5ModelHandle] = {}
+_LIVE_HANDLES: weakref.WeakSet[DLSS5ModelHandle] = weakref.WeakSet()
+_MODEL_LOCK = RLock()
 
 
 def _import_pipeline_class():
@@ -51,22 +58,24 @@ def _import_pipeline_class():
 
 def _import_render_runtime():
     try:
-        from .dlss5.composition import compose_detail, compose_head
-        from .dlss5.features import AutomaticMask, NetworkGeometry, PROFILES, make_features
-        from .dlss5.temporal import (
+        from .dlss5.features import AutomaticMask, NetworkGeometry, PROFILES
+        from .dlss5.tensor_ops import (
             BLEND_SCALE,
+            compose_detail,
+            compose_head,
             compose_temporal,
-            extend_features,
+            make_features,
             make_temporal_features,
             normalize_pixel_motion,
         )
     except (ImportError, ValueError):
-        from dlss5.composition import compose_detail, compose_head
-        from dlss5.features import AutomaticMask, NetworkGeometry, PROFILES, make_features
-        from dlss5.temporal import (
+        from dlss5.features import AutomaticMask, NetworkGeometry, PROFILES
+        from dlss5.tensor_ops import (
             BLEND_SCALE,
+            compose_detail,
+            compose_head,
             compose_temporal,
-            extend_features,
+            make_features,
             make_temporal_features,
             normalize_pixel_motion,
         )
@@ -79,7 +88,6 @@ def _import_render_runtime():
         "compose_detail": compose_detail,
         "BLEND_SCALE": BLEND_SCALE,
         "compose_temporal": compose_temporal,
-        "extend_features": extend_features,
         "make_temporal_features": make_temporal_features,
         "normalize_pixel_motion": normalize_pixel_motion,
     }
@@ -116,10 +124,48 @@ def _resolve_model_path(model_name: str) -> str:
 
 
 def _clear_pipeline_cache() -> None:
-    _PIPELINE_CACHE.clear()
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    with _MODEL_LOCK:
+        # ComfyUI can retain loader outputs after our own cache is cleared.
+        for handle in list(_LIVE_HANDLES):
+            handle.pipeline.model.to("cpu")
+        _PIPELINE_CACHE.clear()
+        gc.collect()
+        model_management.soft_empty_cache()
+
+
+def _with_model_on_device(function):
+    parameters = signature(function)
+
+    @wraps(function)
+    def render(self, dlss5_model, image, *args, **kwargs):
+        if not isinstance(dlss5_model, DLSS5ModelHandle):
+            raise TypeError("dlss5_model must come from the DLSS 5 PyTorch Model Loader")
+        with _MODEL_LOCK, torch.inference_mode():
+            pipeline = dlss5_model.pipeline
+            _image_batch(image)
+            model_management.throw_exception_if_processing_interrupted()
+            # Like ComfyUI's standalone upscaler, reserve working memory before
+            # moving weights and always offload, including on OOM/cancellation.
+            # This is a heuristic; attention memory depends on the frame extent.
+            arguments = parameters.bind(self, dlss5_model, image, *args, **kwargs).arguments
+            scale = arguments["processing_scale"]
+            pixels = max(320, int(image.shape[1] * scale)) * max(320, int(image.shape[2] * scale))
+            # Include non-persistent lookup/bias buffers, which state_dict-based
+            # size estimates omit, and reserve first-use reference constants.
+            model_bytes = sum(t.numel() * t.element_size() for t in
+                              chain(pipeline.model.parameters(), pipeline.model.buffers()))
+            if not hasattr(pipeline.model, "noise_tables"):
+                model_bytes += (3 * (1 << 24) + (1 << 16)) * 4
+            memory = model_bytes + max(1024 ** 3, pixels * 1024)
+            try:
+                model_management.free_memory(memory, pipeline.device)
+                pipeline.model.to(pipeline.device)
+                pipeline.model.interrupt_check = model_management.throw_exception_if_processing_interrupted
+                return function(self, dlss5_model, image, *args, **kwargs)
+            finally:
+                pipeline.model.interrupt_check = None
+                pipeline.model.to("cpu")
+    return render
 
 
 def _load_pipeline(model_path: str, precision: str, device: str) -> DLSS5ModelHandle:
@@ -133,8 +179,9 @@ def _load_pipeline(model_path: str, precision: str, device: str) -> DLSS5ModelHa
     NeuralRenderingPipeline = _import_pipeline_class()
     pipeline = NeuralRenderingPipeline.from_safetensors(
         model_path,
-        device=device,
+        device=model_management.get_torch_device() if device == "auto" else device,
         precision=precision,
+        offload_device="cpu",
     )
     handle = DLSS5ModelHandle(
         pipeline=pipeline,
@@ -143,42 +190,45 @@ def _load_pipeline(model_path: str, precision: str, device: str) -> DLSS5ModelHa
         device=str(pipeline.device),
     )
     _PIPELINE_CACHE[key] = handle
+    _LIVE_HANDLES.add(handle)
     return handle
 
 
-def _image_batch_to_numpy(image: torch.Tensor) -> np.ndarray:
+def _image_batch(image: torch.Tensor) -> torch.Tensor:
     if not isinstance(image, torch.Tensor):
         raise TypeError("IMAGE input must be a torch.Tensor")
     if image.ndim != 4 or image.shape[-1] < 3:
         raise ValueError(f"Expected ComfyUI IMAGE as [B,H,W,C>=3], got {tuple(image.shape)}")
-    return image[..., :3].detach().to(device="cpu", dtype=torch.float32).numpy()
+    if min(image.shape[:3]) <= 0:
+        raise ValueError("IMAGE batch and spatial extent must be non-empty")
+    return image[..., :3].detach()
 
 
-def _motion_batch_to_numpy(motion: torch.Tensor) -> np.ndarray:
+def _motion_batch(motion: torch.Tensor) -> torch.Tensor:
     if not isinstance(motion, torch.Tensor):
         raise TypeError("motion_vectors must be a torch.Tensor")
     if motion.ndim != 4 or motion.shape[-1] < 2:
         raise ValueError(
             f"Expected motion_vectors as [B,H,W,C>=2], got {tuple(motion.shape)}"
         )
-    return motion[..., :2].detach().to(device="cpu", dtype=torch.float32).numpy()
+    return motion[..., :2].detach()
 
 
-def _depth_batch_to_numpy(depth: torch.Tensor) -> np.ndarray:
+def _depth_batch(depth: torch.Tensor) -> torch.Tensor:
     if not isinstance(depth, torch.Tensor):
         raise TypeError("depth_image must be a torch.Tensor")
     if depth.ndim != 4 or depth.shape[-1] < 1:
         raise ValueError(f"Expected depth_image as [B,H,W,C>=1], got {tuple(depth.shape)}")
-    return depth[..., :1].detach().to(device="cpu", dtype=torch.float32).numpy()
+    return depth[..., :1].detach()
 
 
 def _matching_frame(
-    array: np.ndarray | None,
+    array: torch.Tensor | None,
     index: int,
     batch: int,
     *,
     name: str,
-) -> np.ndarray | None:
+) -> torch.Tensor | None:
     if array is None:
         return None
     count = array.shape[0]
@@ -190,10 +240,10 @@ def _matching_frame(
 
 
 def _matching_motion_frame(
-    motion: np.ndarray,
+    motion: torch.Tensor,
     index: int,
     batch: int,
-) -> np.ndarray:
+) -> torch.Tensor:
     count = motion.shape[0]
     if count == 1:
         return motion[0]
@@ -242,7 +292,7 @@ def _resolved_automatic_mask(
 
 
 def _decode_motion(
-    motion: np.ndarray,
+    motion: torch.Tensor,
     *,
     motion_format: str,
     motion_encoding: str,
@@ -254,13 +304,13 @@ def _decode_motion(
     width: int,
     height: int,
     runtime: dict[str, Any],
-) -> np.ndarray:
-    motion = np.asarray(motion, dtype=np.float32)
+) -> torch.Tensor:
+    motion = motion.float()
     if motion_encoding == "0.5-centered RG":
-        motion = (motion - np.float32(0.5)) * np.float32(2.0)
+        motion = (motion - 0.5) * 2.0
     elif motion_encoding != "signed RG":
         raise ValueError("unsupported motion_encoding")
-    motion = motion * np.float32(motion_value_scale)
+    motion = motion * motion_value_scale
 
     if motion_format == "pixel":
         return runtime["normalize_pixel_motion"](
@@ -273,14 +323,14 @@ def _decode_motion(
             jitter_dy=float(jitter_delta_y),
         )
     if motion_format == "normalized UV":
-        out = np.empty_like(motion)
+        out = torch.empty_like(motion)
         out[..., 0] = (
-            motion[..., 0] * np.float32(motion_scale_x)
-            + np.float32(jitter_delta_x / width)
+            motion[..., 0] * motion_scale_x
+            + jitter_delta_x / width
         )
         out[..., 1] = (
-            motion[..., 1] * np.float32(motion_scale_y)
-            + np.float32(jitter_delta_y / height)
+            motion[..., 1] * motion_scale_y
+            + jitter_delta_y / height
         )
         return out
     raise ValueError("motion_format must be 'pixel' or 'normalized UV'")
@@ -305,7 +355,7 @@ def _base_render_required(*, video: bool) -> dict[str, Any]:
             ),
             "intensity": (
                 "FLOAT",
-                {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.01},
+                {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01},
             ),
             "detail_strength": (
                 "FLOAT",
@@ -352,6 +402,11 @@ def _base_render_required(*, video: bool) -> dict[str, Any]:
 
 class DLSS5PyTorchModelLoader:
     @classmethod
+    def IS_CHANGED(cls, model_name: str, precision: str, device: str):
+        stat = os.stat(_resolve_model_path(model_name))
+        return (stat.st_size, stat.st_mtime_ns, precision, device)
+
+    @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
@@ -395,6 +450,7 @@ class DLSS5PyTorchEnhance:
     FUNCTION = "enhance"
     CATEGORY = CATEGORY
 
+    @_with_model_on_device
     def enhance(
         self,
         dlss5_model: DLSS5ModelHandle,
@@ -424,8 +480,8 @@ class DLSS5PyTorchEnhance:
         }:
             raise ValueError("unsupported batch_noise_mode")
 
-        source = _image_batch_to_numpy(image)
-        control = _image_batch_to_numpy(control_image) if control_image is not None else None
+        source = _image_batch(image)
+        control = _image_batch(control_image) if control_image is not None else None
         batch = source.shape[0]
         if batch == 0:
             raise ValueError("IMAGE batch must contain at least one frame")
@@ -457,12 +513,14 @@ class DLSS5PyTorchEnhance:
         except Exception:
             pass
 
-        outputs: list[np.ndarray] = []
+        outputs = torch.empty((*source.shape[:3], 3), device=model_management.intermediate_device(),
+                              dtype=model_management.intermediate_dtype())
         for index in range(batch):
+            model_management.throw_exception_if_processing_interrupted()
             current_frame_index = frame_index
             if batch_noise_mode == "sequence (advance frame index)":
                 current_frame_index += index
-            result = dlss5_model.pipeline.enhance(
+            result = dlss5_model.pipeline.enhance_tensor(
                 source[index],
                 profile=profile,
                 processing_scale=processing_scale,
@@ -477,12 +535,11 @@ class DLSS5PyTorchEnhance:
                 automatic_mask=automatic_mask,
                 **controls,
             )
-            outputs.append(np.asarray(result.image, dtype=np.float32))
+            outputs[index].copy_(result.clamp(0, 1))
             if progress is not None:
                 progress.update(1)
 
-        out = torch.from_numpy(np.stack(outputs, axis=0)).clamp_(0.0, 1.0)
-        return (out.to(device=image.device, dtype=image.dtype),)
+        return (outputs,)
 
 
 class DLSS5PyTorchVideoEnhance:
@@ -550,7 +607,7 @@ class DLSS5PyTorchVideoEnhance:
     CATEGORY = CATEGORY
 
     @staticmethod
-    def _scene_cut(current: np.ndarray, previous: np.ndarray, threshold: float) -> bool:
+    def _scene_cut(current: torch.Tensor, previous: torch.Tensor, threshold: float) -> bool:
         if threshold <= 0:
             return False
         luma_current = (
@@ -563,8 +620,11 @@ class DLSS5PyTorchVideoEnhance:
             + previous[..., 1] * 0.7152
             + previous[..., 2] * 0.0722
         )
-        return float(np.abs(luma_current - luma_previous).mean()) > threshold
+        # Only the optional cut decision needs a scalar synchronization. The
+        # frames and temporal history remain on the rendering device.
+        return (luma_current - luma_previous).abs().mean().item() > threshold
 
+    @_with_model_on_device
     def enhance_video(
         self,
         dlss5_model: DLSS5ModelHandle,
@@ -603,10 +663,10 @@ class DLSS5PyTorchVideoEnhance:
         if processing_scale != 1.0:
             raise ValueError("temporal DLSS 5 currently requires processing_scale=1.0")
 
-        source = _image_batch_to_numpy(image)
-        motion = _motion_batch_to_numpy(motion_vectors)
-        control = _image_batch_to_numpy(control_image) if control_image is not None else None
-        depth = _depth_batch_to_numpy(depth_image) if depth_image is not None else None
+        source = _image_batch(image)
+        motion = _motion_batch(motion_vectors)
+        control = _image_batch(control_image) if control_image is not None else None
+        depth = _depth_batch(depth_image) if depth_image is not None else None
         batch, height, width, _ = source.shape
         if batch == 0:
             raise ValueError("IMAGE batch must contain at least one frame")
@@ -645,13 +705,16 @@ class DLSS5PyTorchVideoEnhance:
         except Exception:
             pass
 
-        outputs: list[np.ndarray] = []
-        history: np.ndarray | None = None
-        previous: np.ndarray | None = None
+        outputs = torch.empty((batch, height, width, 3), device=model_management.intermediate_device(),
+                              dtype=model_management.intermediate_dtype())
+        history: torch.Tensor | None = None
+        previous: torch.Tensor | None = None
         sequence_index = 0
+        device = dlss5_model.pipeline.device
 
         for index in range(batch):
-            frame = source[index]
+            model_management.throw_exception_if_processing_interrupted()
+            frame = source[index].to(device=device, dtype=torch.float32, non_blocking=True)
             if previous is not None and self._scene_cut(
                 frame, previous, float(scene_cut_threshold)
             ):
@@ -664,6 +727,10 @@ class DLSS5PyTorchVideoEnhance:
                 control, index, batch, name="control_image"
             )
             depth_frame = _matching_frame(depth, index, batch, name="depth_image")
+            if control_frame is not None:
+                control_frame = control_frame.to(device=device, dtype=torch.float32, non_blocking=True)
+            if depth_frame is not None:
+                depth_frame = depth_frame.to(device=device, dtype=torch.float32, non_blocking=True)
             geometry = runtime["NetworkGeometry"].vendor_aligned(width, height)
 
             if history is None:
@@ -671,11 +738,12 @@ class DLSS5PyTorchVideoEnhance:
                     frame,
                     frame_index=current_frame_index,
                     geometry=geometry,
+                    noise_tables=dlss5_model.pipeline.noise_tables(),
                     automatic_mask=automatic_mask,
                     control_mask=control_frame,
                     **controls,
                 )
-                head = geometry.crop(dlss5_model.pipeline.run_features(features))
+                head = geometry.crop(dlss5_model.pipeline.run_features_tensor(features))
                 history = runtime["compose_head"](
                     head,
                     frame,
@@ -683,7 +751,7 @@ class DLSS5PyTorchVideoEnhance:
                     intensity=float(intensity),
                 )
             else:
-                raw_motion = _matching_motion_frame(motion, index, batch)
+                raw_motion = _matching_motion_frame(motion, index, batch).to(device=device, dtype=torch.float32, non_blocking=True)
                 normalized_motion = _decode_motion(
                     raw_motion,
                     motion_format=motion_format,
@@ -697,11 +765,13 @@ class DLSS5PyTorchVideoEnhance:
                     height=height,
                     runtime=runtime,
                 )
-                logical_features = runtime["make_temporal_features"](
+                network_features = runtime["make_temporal_features"](
                     frame,
                     history,
                     normalized_motion,
                     frame_index=current_frame_index,
+                    geometry=geometry,
+                    noise_tables=dlss5_model.pipeline.noise_tables(),
                     depth=depth_frame,
                     depth_guide=depth_mode,
                     depth_inverted=bool(depth_inverted),
@@ -709,19 +779,15 @@ class DLSS5PyTorchVideoEnhance:
                     control_mask=control_frame,
                     **controls,
                 )
-                network_features = runtime["extend_features"](
-                    logical_features,
-                    geometry,
-                    current_frame_index,
-                )
                 head = geometry.crop(
-                    dlss5_model.pipeline.run_features(network_features)
+                    dlss5_model.pipeline.run_features_tensor(network_features)
                 )
                 history = runtime["compose_temporal"](
                     head,
                     frame,
-                    logical_features,
+                    geometry.crop(network_features),
                     blend_scale=float(blend_scale),
+                    reference_tables=dlss5_model.pipeline.noise_tables(),
                     control_mask=control_frame,
                     intensity=float(intensity),
                 )
@@ -733,17 +799,20 @@ class DLSS5PyTorchVideoEnhance:
                 colour_strength=float(colour_strength),
                 radius=float(detail_radius),
             )
-            outputs.append(np.asarray(displayed, dtype=np.float32))
+            outputs[index].copy_(displayed.clamp(0, 1))
             previous = frame
             sequence_index += 1
             if progress is not None:
                 progress.update(1)
 
-        out = torch.from_numpy(np.stack(outputs, axis=0)).clamp_(0.0, 1.0)
-        return (out.to(device=image.device, dtype=image.dtype),)
+        return (outputs,)
 
 
 class DLSS5PyTorchClearCache:
+    @classmethod
+    def IS_CHANGED(cls, clear: bool):
+        return float("nan") if clear else False
+
     @classmethod
     def INPUT_TYPES(cls):
         return {"required": {"clear": ("BOOLEAN", {"default": True})}}

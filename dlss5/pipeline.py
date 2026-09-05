@@ -1,6 +1,7 @@
 """Self-contained PyTorch inference pipeline for the recovered DLSS 5 graph."""
 from __future__ import annotations
 
+import json
 import pathlib
 import time
 from dataclasses import dataclass, field
@@ -15,6 +16,19 @@ from .features import PROFILES, AutomaticMask, NetworkGeometry, make_features
 
 PRECISIONS = ("reference", "fast")
 WEIGHT_FORMATS = tuple(f"dlssnr-logical-v{v}" for v in range(8, 19))
+
+
+def validate_weights(weights: dict[str, torch.Tensor]) -> None:
+    spec = json.loads(pathlib.Path(__file__).with_name("weight_spec.json").read_text())["tensors"]
+    missing = sorted(set(spec) - set(weights))
+    if missing:
+        raise ValueError(f"weights are missing {len(missing)} tensors, first: {missing[:3]}")
+    for name, entry in spec.items():
+        value = weights[name]
+        if list(value.shape) != entry["shape"]:
+            raise ValueError(f"{name}: expected shape {entry['shape']}, got {list(value.shape)}")
+        if not value.is_floating_point():
+            raise ValueError(f"{name}: expected floating-point weights, got {value.dtype}")
 
 
 def resolve_device(device: str | torch.device = "auto") -> torch.device:
@@ -44,17 +58,7 @@ def load_weights(path: str | pathlib.Path) -> dict[str, torch.Tensor]:
             raise ValueError("weights must declare fully_logical=true")
         weights = {name: source.get_tensor(name) for name in source.keys()}
 
-    required = {
-        "block0.layer0.input_adapter_weight",
-        "block0.layer0.qkv_weight",
-        "block30.layer4.weight",
-        "block39.layer0.conv_weight",
-        "block70.layer0.out_gain",
-        "block70.layer0.out_conv_weight",
-    }
-    missing = sorted(required.difference(weights))
-    if missing:
-        raise ValueError(f"weights are missing required tensors: {missing}")
+    validate_weights(weights)
     return weights
 
 
@@ -84,9 +88,11 @@ class NeuralRenderingPipeline:
         *,
         device: str | torch.device = "auto",
         precision: str = "reference",
+        offload_device: str | torch.device | None = None,
     ):
         if precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}")
+        validate_weights(weights)
         self.device = resolve_device(device)
         self.precision = precision
         self.model = reference.NeuralRenderingModel(weights).eval()
@@ -95,7 +101,7 @@ class NeuralRenderingPipeline:
         if precision == "fast" and self.device.type != "cpu":
             self.dtype = torch.float16
             self.model = self.model.to(torch.float16)
-        self.model = self.model.to(self.device)
+        self.model = self.model.to(self.device if offload_device is None else offload_device)
 
     @classmethod
     def from_safetensors(
@@ -104,8 +110,9 @@ class NeuralRenderingPipeline:
         *,
         device: str | torch.device = "auto",
         precision: str = "reference",
+        offload_device: str | torch.device | None = None,
     ) -> "NeuralRenderingPipeline":
-        return cls(load_weights(path), device=device, precision=precision)
+        return cls(load_weights(path), device=device, precision=precision, offload_device=offload_device)
 
     @torch.no_grad()
     def run_features(self, features: np.ndarray) -> np.ndarray:
@@ -114,13 +121,66 @@ class NeuralRenderingPipeline:
     @torch.no_grad()
     def run_features_batch(self, features: np.ndarray) -> np.ndarray:
         features = np.asarray(features, dtype=np.float32)
+        return self.run_features_tensor(torch.from_numpy(np.ascontiguousarray(features))).cpu().numpy()
+
+    @torch.inference_mode()
+    def run_features_tensor(self, features: torch.Tensor) -> torch.Tensor:
+        """Evaluate HWC or BHWC features without copying the head to the CPU."""
+        single = features.ndim == 3
+        if single:
+            features = features.unsqueeze(0)
         if features.ndim != 4 or features.shape[-1] != 16:
             raise ValueError("features must be [B,H,W,16]")
         if features.shape[1] % 64 or features.shape[2] % 64:
             raise ValueError("feature extent must be a multiple of 64")
-        tensor = torch.from_numpy(np.ascontiguousarray(features)).to(self.device, self.dtype)
+        tensor = features.to(device=self.device, dtype=self.dtype, non_blocking=True)
         head = self.model(tensor)
-        return head.to(torch.float32).cpu().numpy()
+        return (head[0] if single else head).float()
+
+    @torch.inference_mode()
+    def enhance_tensor(
+        self, image: torch.Tensor, *, profile: str = "standard", processing_scale: float = 1.0,
+        detail_strength: float = 1.0, colour_strength: float = 1.0, detail_radius: float = 4.0,
+        intensity: float = 1.0, frame_index: int = 0, control_mask: torch.Tensor | None = None,
+        automatic_mask: AutomaticMask | None = None, normalized_style: float | None = None,
+        local_tone_strength: float | None = None, local_structure_strength: float | None = None,
+    ) -> torch.Tensor:
+        """End-to-end tensor rendering; output remains on the model device.
+
+        ComfyUI moves only the input frame onto this device and the final image
+        to its configured intermediate device. All image math stays here.
+        """
+        from . import tensor_ops as ops
+
+        if not 1.0 <= processing_scale <= 4.0:
+            raise ValueError("processing_scale must be within [1, 4]")
+        if control_mask is not None and processing_scale != 1.0:
+            raise ValueError("a control mask requires processing_scale=1")
+        if image.ndim != 3 or image.shape[-1] != 3:
+            raise ValueError("image must be [H,W,3]")
+        source = image.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        if control_mask is not None:
+            control_mask = control_mask.to(device=self.device, dtype=torch.float32, non_blocking=True)
+        processing = ops.resample(source, round(source.shape[1] * processing_scale),
+                                  round(source.shape[0] * processing_scale))
+        geometry = NetworkGeometry.vendor_aligned(processing.shape[1], processing.shape[0])
+        controls = self._controls(profile, normalized_style, local_tone_strength, local_structure_strength)
+        features = ops.make_features(processing, frame_index=frame_index, geometry=geometry,
+                                      control_mask=control_mask, automatic_mask=automatic_mask,
+                                      noise_tables=self.noise_tables(), **controls)
+        head = geometry.crop(self.run_features_tensor(features))
+        composed = ops.compose_head(head, processing, control_mask=control_mask, intensity=intensity)
+        composed = ops.resample(composed, source.shape[1], source.shape[0])
+        return ops.compose_detail(source, composed, detail_strength=detail_strength,
+                                   colour_strength=colour_strength, radius=detail_radius)
+
+    def noise_tables(self):
+        """Lazily initialize reference constants, owned/offloaded by the model."""
+        from .tensor_ops import ReferenceNoiseTables
+
+        if not hasattr(self.model, "noise_tables"):
+            self.model.add_module("noise_tables", ReferenceNoiseTables().to(self.device))
+        return self.model.noise_tables
 
     def _controls(
         self,

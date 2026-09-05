@@ -90,7 +90,7 @@ def e4m3_round_trip(value: torch.Tensor) -> torch.Tensor:
         )
         rounded = torch.round(magnitude / step) * step
         return torch.where(value < 0, -rounded, rounded)
-    if value.device.type in _FLOAT8_CAST_DEVICES and value.dtype == torch.float32:
+    if value.device.type in _FLOAT8_CAST_DEVICES and value.dtype in (torch.float16, torch.float32):
         return value.clamp(-448, 448).to(torch.float8_e4m3fn).to(value.dtype)
     if CHUNK_TOKENS > 0 and value.numel() > 8 * CHUNK_TOKENS:
         flat = value.reshape(-1)
@@ -190,19 +190,15 @@ def vendor_cosine_normalize(value: torch.Tensor) -> torch.Tensor:
     if half.shape[-1] != 32:
         squared_norm = half.square().sum(dim=-1, keepdim=True, dtype=torch.float16)
         return (half * squared_norm.clamp_min(COSINE_NORM_FLOOR).rsqrt()).to(value.dtype)
-    partial = []
-    for lane in range(4):
-        lane_partial = []
-        for parity in range(2):
-            channel = lane * 2 + parity
-            first = _half_fma(half[..., channel + 8], half[..., channel + 8], _half_multiply(half[..., channel], half[..., channel]))
-            second = _half_fma(half[..., channel + 24], half[..., channel + 24], _half_multiply(half[..., channel + 16], half[..., channel + 16]))
-            lane_partial.append(_half_add(first, second))
-        partial.append(torch.stack(lane_partial, dim=-1))
-    partial_tensor = torch.stack(partial, dim=-2)
-    xor_two = torch.stack([_half_add(partial_tensor[..., lane, :], partial_tensor[..., lane ^ 2, :]) for lane in range(4)], dim=-2)
-    xor_one = torch.stack([_half_add(xor_two[..., lane, :], xor_two[..., lane ^ 1, :]) for lane in range(4)], dim=-2)
-    norm = _half_add(xor_one[..., 0, 0], xor_one[..., 0, 1])
+    # Vectorize lanes/parities, retaining every half rounding and the exact
+    # fragment-tree reduction order. Only lane zero's final norm is consumed.
+    a, b, c, d = half.unflatten(-1, (4, 4, 2)).unbind(-3)
+    partial = _half_add(_half_fma(b, b, _half_multiply(a, a)),
+                        _half_fma(d, d, _half_multiply(c, c)))
+    even = _half_add(partial[..., 0, :], partial[..., 2, :])
+    odd = _half_add(partial[..., 1, :], partial[..., 3, :])
+    pair = _half_add(even, odd)
+    norm = _half_add(pair[..., 0], pair[..., 1])
     norm = torch.maximum(norm, torch.full_like(norm, COSINE_NORM_FLOOR))
     reciprocal = norm.to(torch.float32).rsqrt().to(torch.float16).unsqueeze(-1)
     return _half_multiply(half, reciprocal).to(value.dtype)
@@ -391,15 +387,25 @@ def branched_feed_forward(value: torch.Tensor, *, expansion_weight: torch.Tensor
     if channels < 64 or channels % 32:
         raise ValueError("branched feed-forward input must have 32-aligned channels")
     channel_groups = channels // 32
-    input_heads = value.split(32, dim=-1)
-    output_heads = []
-    for output_head in range(channel_groups):
-        branches = []
-        for branch in range(4):
-            expanded = sum(input_heads[input_head] @ expansion_weight[output_head, branch, input_head] for input_head in range(channel_groups))
-            branches.append(e4m3_round_trip(quadratic_gate_activation(expanded)) @ branch_projection_weight[output_head, branch])
-        output_heads.append(e4m3_round_trip(sum(branches)))
-    return torch.cat(output_heads, dim=-1) @ output_projection_weight
+    if expansion_weight.shape != (channel_groups, 4, channel_groups, 32, 32):
+        raise ValueError("invalid branched expansion weight shape")
+    if branch_projection_weight.shape != (channel_groups, 4, 32, 32):
+        raise ValueError("invalid branch projection weight shape")
+    if output_projection_weight.shape != (channels, channels):
+        raise ValueError("invalid branched output projection weight shape")
+    tokens = value.reshape(-1, channel_groups, 32)
+    # Batch output heads and branches in a single GEMM per input head. Keep
+    # the input-head additions sequential: collapsing the K dimension changes
+    # the half rounding contract of the recovered network.
+    expanded = None
+    for head in range(channel_groups):
+        part = tokens[:, head] @ expansion_weight[:, :, head].reshape(-1, 32, 32)
+        expanded = part if expanded is None else expanded + part
+    activated = e4m3_round_trip(quadratic_gate_activation(expanded))
+    branches = (activated @ branch_projection_weight.reshape(-1, 32, 32)).reshape(channel_groups, 4, -1, 32)
+    merged = ((branches[:, 0] + branches[:, 1]) + branches[:, 2]) + branches[:, 3]
+    joined = e4m3_round_trip(merged).permute(1, 0, 2).reshape(*value.shape)
+    return joined @ output_projection_weight
 
 
 def split_group_feed_forward(value: torch.Tensor, *, first_projection_weight: torch.Tensor, expand_weight: torch.Tensor, project_weight: torch.Tensor) -> torch.Tensor:
@@ -407,9 +413,17 @@ def split_group_feed_forward(value: torch.Tensor, *, first_projection_weight: to
     if channels % 64:
         raise ValueError("split feed-forward channels must be divisible by 64")
     groups = channels // 64
+    if first_projection_weight.shape != (channels, channels):
+        raise ValueError("invalid split first projection shape")
+    if expand_weight.shape != (groups, 64, 256):
+        raise ValueError("invalid split group expansion shape")
+    if project_weight.shape != (groups, 256, 64):
+        raise ValueError("invalid split group projection shape")
     hidden = e4m3_round_trip(value @ first_projection_weight)
-    outputs = [quadratic_gate_activation(group_hidden @ expand_weight[group]) @ project_weight[group] for group, group_hidden in enumerate(hidden.split(64, dim=-1))]
-    return e4m3_round_trip(torch.cat(outputs, dim=-1))
+    grouped = hidden.reshape(-1, groups, 64).permute(1, 0, 2)
+    outputs = quadratic_gate_activation(torch.bmm(grouped, expand_weight))
+    outputs = torch.bmm(outputs, project_weight).permute(1, 0, 2).reshape(*value.shape)
+    return e4m3_round_trip(outputs)
 
 
 def branched_window_block(value: torch.Tensor, *, expansion_weight: torch.Tensor, branch_projection_weight: torch.Tensor, output_projection_weight: torch.Tensor, feed_forward_cosine: torch.Tensor, qkv_weight: torch.Tensor, attention_scale: torch.Tensor, attention_bias: torch.Tensor, attention_projection_weight: torch.Tensor, attention_cosine: torch.Tensor, head_count: int, window_size: int, window_origin: tuple[int, int] = (0, 0)) -> torch.Tensor:
@@ -491,11 +505,21 @@ class NeuralRenderingModel(nn.Module):
     """Fixed recovered 71-block graph with external logical weights."""
     def __init__(self, weights: dict[str, torch.Tensor]):
         super().__init__()
+        self.interrupt_check = None
         self._weight_attributes: dict[str, str] = {}
+        self._attention_bias_attributes: dict[str, str] = {}
         for index, (name, value) in enumerate(sorted(weights.items())):
             attribute = f"weight_{index}"
             self.register_buffer(attribute, value.detach().to(dtype=torch.float32))
             self._weight_attributes[name] = attribute
+            if name.endswith(".attn_bias") and value.ndim == 3 and value.shape[0] in (1, 16):
+                bias_attribute = f"attention_bias_{index}"
+                self.register_buffer(bias_attribute, recover_attention_bias_layout(value.detach().float()), persistent=False)
+                self._attention_bias_attributes[name] = bias_attribute
+
+    def _attention_bias(self, name: str) -> torch.Tensor:
+        attribute = self._attention_bias_attributes.get(name)
+        return self.weight(name) if attribute is None else getattr(self, attribute)
 
     def weight(self, name: str) -> torch.Tensor:
         try:
@@ -504,10 +528,10 @@ class NeuralRenderingModel(nn.Module):
             raise ValueError(f"missing logical weight: {name}") from error
 
     def _window(self, value: torch.Tensor, index: int, *, head_count: int, publish: bool = True) -> torch.Tensor:
+        if self.interrupt_check is not None:
+            self.interrupt_check()
         prefix = f"block{index}.layer0"
-        attention_bias = self.weight(f"{prefix}.attn_bias")
-        if uses_fragment_swizzle(index, head_count):
-            attention_bias = recover_attention_bias_layout(attention_bias)
+        attention_bias = self._attention_bias(f"{prefix}.attn_bias")
         if f"{prefix}.ffn_expand_weight" in self._weight_attributes:
             output = branched_window_block(value, expansion_weight=self.weight(f"{prefix}.ffn_expand_weight"), branch_projection_weight=self.weight(f"{prefix}.ffn_branch_projection_weight"), output_projection_weight=self.weight(f"{prefix}.ffn_output_projection_weight"), feed_forward_cosine=self.weight(f"{prefix}.ffn_cos_skip"), qkv_weight=self.weight(f"{prefix}.qkv_weight"), attention_scale=self.weight(f"{prefix}.attn_scale"), attention_bias=attention_bias, attention_projection_weight=self.weight(f"{prefix}.projection_weight"), attention_cosine=self.weight(f"{prefix}.attn_cos_skip"), head_count=head_count, window_size=8, window_origin=recovered_window_origin(index))
         else:
@@ -515,16 +539,17 @@ class NeuralRenderingModel(nn.Module):
         return output if index in (0, 70) or not publish else e4m3_round_trip(output)
 
     def _split_window(self, value: torch.Tensor, index: int) -> torch.Tensor:
+        if self.interrupt_check is not None:
+            self.interrupt_check()
         prefix = f"block{index}"
         return e4m3_round_trip(split_window_block(value, first_projection_weight=self.weight(f"{prefix}.layer0.first_projection_weight"), expand_weight=self.weight(f"{prefix}.layer0.group_expand_weight"), project_weight=self.weight(f"{prefix}.layer0.group_project_weight"), feed_forward_projection_weight=self.weight(f"{prefix}.layer1.weight3"), feed_forward_cosine=self.weight(f"{prefix}.layer1.ffn_cos_skip"), qkv_weight=self.weight(f"{prefix}.layer2.qkv_weight"), attention_scale=self.weight(f"{prefix}.layer2.attn_scale"), attention_bias=self._split_attention_bias(index), attention_projection_weight=self.weight(f"{prefix}.layer3.projection_weight"), attention_cosine=self.weight(f"{prefix}.layer3.attn_cos_skip"), head_count=16, window_size=8, window_origin=recovered_window_origin(index)))
 
     def _split_attention_bias(self, index: int) -> torch.Tensor:
-        attention_bias = self.weight(f"block{index}.layer2.attn_bias")
-        if uses_fragment_swizzle(index, 16):
-            attention_bias = recover_attention_bias_layout(attention_bias)
-        return attention_bias
+        return self._attention_bias(f"block{index}.layer2.attn_bias")
 
     def _global(self, value: torch.Tensor, index: int) -> torch.Tensor:
+        if self.interrupt_check is not None:
+            self.interrupt_check()
         prefix = f"block{index}"
         return e4m3_round_trip(global_block(value, expansion_weight=self.weight(f"{prefix}.layer0.weight"), feed_forward_projection_weight=self.weight(f"{prefix}.layer1.weight"), feed_forward_cosine=self.weight(f"{prefix}.layer1.ffn_cos_skip"), qkv_weight=self.weight(f"{prefix}.layer2.qkv_weight"), attention_scale=self.weight(f"{prefix}.layer2.attn_scale"), attention_projection_weight=self.weight(f"{prefix}.layer4.projection_weight"), attention_cosine=self.weight(f"{prefix}.layer4.attn_cos_skip"), head_count=32))
 

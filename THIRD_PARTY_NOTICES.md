@@ -10,7 +10,9 @@ This project contains Python source derived from the MLX-DLSS project:
 - License: Apache License 2.0
 
 The derived/adapted implementation is located primarily under `dlss5/`.
-Changes made here include packaging the inference code directly inside a ComfyUI custom node, removing the external `mlxdlss` package dependency, simplifying runtime weight validation, and adapting the public entry point for ComfyUI.
+Changes made here include packaging the inference code and `weight_spec.json` directly inside a ComfyUI custom node, removing the external `mlxdlss` package dependency, and adapting the public entry point and model lifecycle for ComfyUI. Complete tensor name/shape validation uses the bundled upstream specification.
+
+The device-resident implementation in `dlss5/tensor_ops.py` adapts the recovered feature, temporal, and composition formulas to PyTorch. Model changes batch independent feed-forward operations, vectorize the recovered normalization tree, and cache attention-bias layouts while preserving publication points and arithmetic order.
 
 A copy of the Apache License 2.0 is provided at `licenses/MLX-DLSS-APACHE-2.0.txt`.
 

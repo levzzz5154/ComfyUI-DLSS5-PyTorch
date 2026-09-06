@@ -6,3 +6,4 @@ venv/
 *.safetensors
 models/
 .opencode/
+.workbuddy-ai/

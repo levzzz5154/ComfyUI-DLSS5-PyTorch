@@ -180,6 +180,17 @@ This loads the weights on CPU and validates the same contract as the node; it do
 | Missing tensors or shape mismatch | Re-extract and decode with the documented DLL and tool revision; the checkpoint must match the bundled specification. |
 | No models in the loader dropdown | Check the actual ComfyUI installation's `models/dlss5/` directory, the `.safetensors` extension, and restart ComfyUI after copying the file. |
 
+## Sample image workflow
+
+Download the [sample workflow](examples/dlss5-image-sample.json) and its [input screenshot](examples/Screenshot_20260830_105338.png).
+
+1. Open or drag the workflow JSON into ComfyUI.
+2. Upload the screenshot through **Load Image**, or copy it into `ComfyUI/input/` under its original filename, `Screenshot_20260830_105338.png`.
+3. In **DLSS 5 PyTorch Model Loader**, select your extracted logical checkpoint. The saved workflow uses `dlssnr-decoded.safetensors`; select `dlssnr-weights-logical.safetensors` instead if you followed the extraction guide above.
+4. Run the workflow. It uses the standard profile, processing scale 1, full intensity, `fast` precision, and automatic device selection, then displays the result in **Preview Image**.
+
+The screenshot is the input, not an example of the processed output. Model weights must be supplied separately.
+
 ## Nodes
 
 ### DLSS 5 PyTorch Model Loader

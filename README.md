@@ -53,13 +53,13 @@ There is no hidden runtime behind the ComfyUI nodes.
 
 ## Installation
 
-For a private clone, GitHub CLI is convenient:
+Clone this repository into your ComfyUI installation and install the dependencies with the Python interpreter used by ComfyUI:
 
 ```bash
 cd ComfyUI/custom_nodes
-gh repo clone levzzz5154/ComfyUI-DLSS5-PyTorch
+git clone https://github.com/levzzz5154/ComfyUI-DLSS5-PyTorch.git
 cd ComfyUI-DLSS5-PyTorch
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 Restart ComfyUI.
@@ -74,17 +74,111 @@ safetensors
 
 PyTorch itself is supplied by ComfyUI.
 
-## Weights
+## Weights: extract and decode with MLX-DLSS
 
-Place a compatible **fully-logical** DLSS 5 safetensors file in:
+Weights are not included or downloaded by this extension. Use [MLX-DLSS](https://github.com/iamwavecut/MLX-DLSS) once to extract a DLL you supply and decode its packed tensors. ComfyUI then loads the resulting **fully-logical `.safetensors`** directly; the extraction tools and DLL are not needed for rendering.
 
-```text
-ComfyUI/models/dlss5/
+### 1. Obtain the neural-rendering DLL
+
+You need **`nvngx_dlssnr.dll`**, not the Super Resolution DLL (`nvngx_dlss.dll`) or frame-generation library (`nvngx_dlssg.dll` / `libnvidia-ngx-dlssg.so`). Upstream identifies the Streamline SDK distribution's `bin/x64/nvngx_dlssnr.dll` and games shipping DLSS 5 as sources; see [upstream weight requirements](https://github.com/iamwavecut/MLX-DLSS#weights) and [NVIDIA Streamline releases](https://github.com/NVIDIA-RTX/Streamline/releases). Supply your own copy; no proprietary DLL or extracted weights are redistributed here.
+
+The extractor's [known-build table](https://github.com/iamwavecut/MLX-DLSS/blob/7debaaf28c8f3b789e0d95cc06abd9796da00170/python/mlxdlss/tools/cli.py) identifies:
+
+- File version: `310.8.0.0`
+- SHA-256: `ceb6432f6fbdf44d886014bcd47241932bf8b67439feef9bbdd0961436662650`
+
+Check the hash with the command below. A matching version number alone is insufficient. The hash command prints `unknown checkpoint` for an unrecognized file but still exits successfully; read its output. An unknown build may decode, but successful decoding and shape validation do not establish numerical compatibility with the supported build.
+
+### 2. Install the extraction tools separately
+
+Use Git and Python 3.10 or newer. An isolated environment keeps the extractor's dependencies separate from ComfyUI. The following pins the inspected extractor revision, which emits `dlssnr-logical-v18`, a format this extension accepts. Clone MLX-DLSS outside `ComfyUI/custom_nodes`:
+
+```bash
+git clone https://github.com/iamwavecut/MLX-DLSS.git
+cd MLX-DLSS
+git checkout 7debaaf28c8f3b789e0d95cc06abd9796da00170
 ```
 
-The loader currently accepts recovered logical formats `dlssnr-logical-v8` through `dlssnr-logical-v18` with metadata `fully_logical=true`.
+Linux/macOS:
 
-No weights are included in this repository.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install ./python
+```
+
+Windows PowerShell:
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install ./python
+```
+
+The base Python package is sufficient. Extraction reads the DLL as data: it does not execute it, require an NVIDIA GPU, or require building the Swift/Metal runtime. Core ML, web, and video extras are unnecessary. The package's base dependencies include PyTorch, NumPy, Pillow, and safetensors; see [upstream package configuration](https://github.com/iamwavecut/MLX-DLSS/blob/7debaaf28c8f3b789e0d95cc06abd9796da00170/python/pyproject.toml).
+
+### 3. Extract the packed weights, then decode them
+
+Run from the MLX-DLSS checkout. Replace the quoted DLL path with your own. On Linux/macOS, with the environment above active:
+
+```bash
+mlxdlss-weights sha256 "/path/to/nvngx_dlssnr.dll"
+mkdir -p weights
+mlxdlss-weights extract "/path/to/nvngx_dlssnr.dll" weights/dlssnr-weights-packed.safetensors
+mlxdlss-weights decode weights/dlssnr-weights-packed.safetensors weights/dlssnr-weights-logical.safetensors
+```
+
+Windows PowerShell, without needing to activate the environment:
+
+```powershell
+.\.venv\Scripts\mlxdlss-weights.exe sha256 "C:\path\to\nvngx_dlssnr.dll"
+New-Item -ItemType Directory -Force weights
+.\.venv\Scripts\mlxdlss-weights.exe extract "C:\path\to\nvngx_dlssnr.dll" weights/dlssnr-weights-packed.safetensors
+.\.venv\Scripts\mlxdlss-weights.exe decode weights/dlssnr-weights-packed.safetensors weights/dlssnr-weights-logical.safetensors
+```
+
+`extract` produces an **opaque packed intermediate**, which this ComfyUI loader cannot use. `decode` produces the logical floating-point tensors. For the supported layout, the decoder reports 153 decoded source tensors, 649 output tensors, `unsupportedSourceTensorCount: 0`, and `opaqueOutputTensorCount: 0`. The output metadata must contain `fully_logical=true` and `format=dlssnr-logical-v18`. See the [decoder source](https://github.com/iamwavecut/MLX-DLSS/blob/7debaaf28c8f3b789e0d95cc06abd9796da00170/python/mlxdlss/tools/unpack_dlssnr_weights.py).
+
+Alternatively, upstream's combined command runs extraction, decoding, and MLX packaging:
+
+```bash
+mlxdlss-weights all "/path/to/nvngx_dlssnr.dll" weights
+```
+
+On Windows, use `.\.venv\Scripts\mlxdlss-weights.exe` as above. The combined command writes `weights/dlssnr-weights-logical.safetensors` plus packed and `.dlssmodel` artifacts. ComfyUI needs only the logical safetensors file; omit `--coreml` and ignore the MLX package. The separate `extract` / `decode` commands avoid generating that extra package.
+
+### 4. Install and validate the logical checkpoint
+
+Copy **`weights/dlssnr-weights-logical.safetensors`** into your ComfyUI installation:
+
+```text
+ComfyUI/
+└── models/
+    └── dlss5/
+        └── dlssnr-weights-logical.safetensors
+```
+
+Create `models/dlss5` if needed. For Windows portable ComfyUI, this is under `ComfyUI_windows_portable/ComfyUI/models/dlss5/`. The filename is arbitrary; changing a packed file's name does not decode it.
+
+Restart ComfyUI, add **DLSS 5 PyTorch Model Loader**, and select the file. Connect its `dlss5_model` output to the still or video rendering node. The loader accepts formats `dlssnr-logical-v8` through `dlssnr-logical-v18`, requires `fully_logical=true`, and checks all 649 required tensor names, shapes, and floating-point dtypes. These format versions are decoder revisions, not NVIDIA DLL versions.
+
+For a standalone validation before launching ComfyUI, run this from **this repository's root** using ComfyUI's Python interpreter (replace `python` with its full path if necessary):
+
+```bash
+python -c "from dlss5.pipeline import load_weights; w = load_weights('../../models/dlss5/dlssnr-weights-logical.safetensors'); print('Validated', len(w), 'tensors')"
+```
+
+This loads the weights on CPU and validates the same contract as the node; it does not run inference.
+
+### Extraction and loading troubleshooting
+
+| Symptom | What to check |
+| --- | --- |
+| `mlxdlss-weights` is not found | Activate the extraction environment, or invoke `.venv/bin/mlxdlss-weights` on Linux/macOS or `.\.venv\Scripts\mlxdlss-weights.exe` on Windows. |
+| `unknown checkpoint` from `sha256` | Compare the full hash above and verify that the input is the neural-rendering DLL. The same version string can accompany a different file. |
+| Missing `WEIGHTS_HT`, unknown tensor families, or nonzero unsupported/opaque counts | Check the DLL build and extractor revision. Do not edit metadata to force an unsupported file through the loader. `mlxdlss-weights inspect weights/dlssnr-weights-packed.safetensors` lists the extracted contents for diagnosis. |
+| Unsupported format or missing `fully_logical=true` | Select the output of `decode`, not the packed intermediate, a frame-generation checkpoint, `.dlssmodel`, or `.mlpackage`. Use the pinned extractor if a newer revision emits a format this extension does not accept. |
+| Missing tensors or shape mismatch | Re-extract and decode with the documented DLL and tool revision; the checkpoint must match the bundled specification. |
+| No models in the loader dropdown | Check the actual ComfyUI installation's `models/dlss5/` directory, the `.safetensors` extension, and restart ComfyUI after copying the file. |
 
 ## Nodes
 

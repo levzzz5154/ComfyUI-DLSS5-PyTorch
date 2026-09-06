@@ -4,6 +4,10 @@ A **self-contained ComfyUI implementation with a GPU-resident PyTorch rendering 
 
 The reverse-engineering work this implementation is based on comes from [iamwavecut/MLX-DLSS](https://github.com/iamwavecut/MLX-DLSS). The required model/runtime code is included directly in this repository as ordinary Python source under `dlss5/`.
 
+![DLSS 5 PyTorch workflow in ComfyUI showing the model loader, input image, rendering controls, and output preview](examples/workflow-preview.png)
+
+[Download the sample workflow and input image](#sample-image-workflow).
+
 ## What “self-contained” means here
 
 This repository does **not** depend on the `mlxdlss` Python package and does not download MLX-DLSS at install or runtime.

@@ -11,7 +11,7 @@ import numpy as np
 import torch
 
 from . import model as reference
-from .composition import compose_detail, compose_head, resample
+from .composition import blend_effect, compose_detail, compose_head, resample
 from .features import PROFILES, AutomaticMask, NetworkGeometry, make_features
 
 PRECISIONS = ("reference", "fast")
@@ -169,10 +169,11 @@ class NeuralRenderingPipeline:
                                       control_mask=control_mask, automatic_mask=automatic_mask,
                                       noise_tables=self.noise_tables(), **controls)
         head = geometry.crop(self.run_features_tensor(features))
-        composed = ops.compose_head(head, processing, control_mask=control_mask, intensity=intensity)
+        composed = ops.compose_head(head, processing)
         composed = ops.resample(composed, source.shape[1], source.shape[0])
-        return ops.compose_detail(source, composed, detail_strength=detail_strength,
-                                   colour_strength=colour_strength, radius=detail_radius)
+        output = ops.compose_detail(source, composed, detail_strength=detail_strength,
+                                    colour_strength=colour_strength, radius=detail_radius)
+        return ops.blend_effect(source, output, control_mask=control_mask, intensity=intensity)
 
     def noise_tables(self):
         """Lazily initialize reference constants, owned/offloaded by the model."""
@@ -270,8 +271,6 @@ class NeuralRenderingPipeline:
         composed = compose_head(
             prepared.geometry.crop(head),
             prepared.processing,
-            control_mask=prepared.control_mask,
-            intensity=intensity,
         )
         if composed.shape[:2] != prepared.source.shape[:2]:
             composed = resample(composed, prepared.source.shape[1], prepared.source.shape[0])
@@ -283,7 +282,7 @@ class NeuralRenderingPipeline:
             radius=detail_radius,
         )
         return EnhanceResult(
-            image=output,
+            image=blend_effect(prepared.source, output, control_mask=prepared.control_mask, intensity=intensity),
             network_extent=(prepared.geometry.network_height, prepared.geometry.network_width),
             timings={
                 "preprocess": prepared.preprocess_seconds,

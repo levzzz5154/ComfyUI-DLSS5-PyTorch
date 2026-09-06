@@ -47,7 +47,7 @@ The **model weight data** is not bundled. You need the libraries listed below an
 
 The NumPy implementations in `features.py`, `temporal.py`, and `composition.py`, plus the NumPy pipeline API, remain available for reference comparisons. They are not used for per-frame image processing by the nodes.
 
-Transformer optimizations batch the independent feed-forward heads/branches into GEMMs, vectorize cosine normalization while preserving its half-rounding reduction tree, use native PyTorch float8 conversion for E4M3 publication on CUDA, and cache recovered attention-bias layouts. The custom softmax is preserved; substituting standard softmax/Flash Attention would change the recovered network.
+Transformer optimizations batch the independent feed-forward heads/branches into GEMMs, vectorize cosine normalization while preserving its half-rounding reduction tree, use native PyTorch float8 conversion for E4M3 publication on CUDA, and cache recovered attention-bias layouts. The recovered bit-affine exponential is preserved. The 64-token window path retains E4M3 probabilities; longer global-attention rows use float32 totals and float16 probabilities to avoid overflow and E4M3 underflow. This numerical safeguard is not validated against NVIDIA captures at those extents.
 
 There is no hidden runtime behind the ComfyUI nodes.
 
@@ -128,6 +128,8 @@ The RGB control image follows the recovered contract:
 - R: final effect blend
 - G: local tone multiplier
 - B: local structure multiplier
+
+Intensity and the red control channel blend the finished effect against the original image after resizing and detail filtering. Zero intensity or zero red preserves the source pixel. Video history retains the full neural result before this display blend.
 
 An explicit control image takes precedence over automatic masking. `sequence (advance frame index)` only changes deterministic noise across a batch; it does **not** turn the still node into a temporal sequence.
 

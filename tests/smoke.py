@@ -179,6 +179,10 @@ def make_fake_runtime(captured_motion: list[np.ndarray]):
         del head, kwargs
         return (color + 0.1).clamp(0, 1)
 
+    def blend_effect(color, output, control_mask, intensity):
+        blend = intensity if control_mask is None else control_mask[..., :1] * intensity
+        return (color + blend * (output - color)).clamp(0, 1)
+
     def compose_detail(source, output, **kwargs):
         del source, kwargs
         return output.float()
@@ -210,6 +214,7 @@ def make_fake_runtime(captured_motion: list[np.ndarray]):
         return (color + 0.2).clamp(0, 1)
 
     return {
+        "blend_effect": blend_effect,
         "AutomaticMask": FakeAutomaticMask,
         "NetworkGeometry": FakeGeometry,
         "PROFILES": profiles,

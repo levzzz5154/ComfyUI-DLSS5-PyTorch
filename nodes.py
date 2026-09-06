@@ -61,6 +61,7 @@ def _import_render_runtime():
         from .dlss5.features import AutomaticMask, NetworkGeometry, PROFILES
         from .dlss5.tensor_ops import (
             BLEND_SCALE,
+            blend_effect,
             compose_detail,
             compose_head,
             compose_temporal,
@@ -72,6 +73,7 @@ def _import_render_runtime():
         from dlss5.features import AutomaticMask, NetworkGeometry, PROFILES
         from dlss5.tensor_ops import (
             BLEND_SCALE,
+            blend_effect,
             compose_detail,
             compose_head,
             compose_temporal,
@@ -85,6 +87,7 @@ def _import_render_runtime():
         "PROFILES": PROFILES,
         "make_features": make_features,
         "compose_head": compose_head,
+        "blend_effect": blend_effect,
         "compose_detail": compose_detail,
         "BLEND_SCALE": BLEND_SCALE,
         "compose_temporal": compose_temporal,
@@ -747,8 +750,6 @@ class DLSS5PyTorchVideoEnhance:
                 history = runtime["compose_head"](
                     head,
                     frame,
-                    control_mask=control_frame,
-                    intensity=float(intensity),
                 )
             else:
                 raw_motion = _matching_motion_frame(motion, index, batch).to(device=device, dtype=torch.float32, non_blocking=True)
@@ -788,8 +789,6 @@ class DLSS5PyTorchVideoEnhance:
                     geometry.crop(network_features),
                     blend_scale=float(blend_scale),
                     reference_tables=dlss5_model.pipeline.noise_tables(),
-                    control_mask=control_frame,
-                    intensity=float(intensity),
                 )
 
             displayed = runtime["compose_detail"](
@@ -799,6 +798,8 @@ class DLSS5PyTorchVideoEnhance:
                 colour_strength=float(colour_strength),
                 radius=float(detail_radius),
             )
+            displayed = runtime["blend_effect"](frame, displayed, control_mask=control_frame,
+                                                 intensity=float(intensity))
             outputs[index].copy_(displayed.clamp(0, 1))
             previous = frame
             sequence_index += 1

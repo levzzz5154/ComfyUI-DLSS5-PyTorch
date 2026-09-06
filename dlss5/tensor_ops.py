@@ -281,8 +281,8 @@ def make_temporal_features(color: torch.Tensor, history: torch.Tensor, motion: t
                          frame_index=frame_index, **controls)
 
 
-def _blend(color: torch.Tensor, predicted: torch.Tensor, control_mask: torch.Tensor | None,
-           intensity: float) -> torch.Tensor:
+def blend_effect(color: torch.Tensor, predicted: torch.Tensor, control_mask: torch.Tensor | None = None,
+                 intensity: float = 1.0) -> torch.Tensor:
     if not math.isfinite(intensity):
         raise ValueError("intensity must be finite")
     if control_mask is None:
@@ -296,7 +296,7 @@ def _blend(color: torch.Tensor, predicted: torch.Tensor, control_mask: torch.Ten
 
 def compose_head(head: torch.Tensor, color: torch.Tensor, *, control_mask=None,
                  intensity: float = 1.0) -> torch.Tensor:
-    return _blend(color, (color + half(head[..., :3]) * 0.25).clamp(0, 1), control_mask, intensity)
+    return blend_effect(color, (color + half(head[..., :3]) * 0.25).clamp(0, 1), control_mask, intensity)
 
 
 def compose_temporal(head: torch.Tensor, color: torch.Tensor, features: torch.Tensor, *,
@@ -313,7 +313,7 @@ def compose_temporal(head: torch.Tensor, color: torch.Tensor, features: torch.Te
     temporal = predicted + alpha * (history - predicted)
     if control_mask is None and intensity == 1:
         return temporal
-    return _blend(color, temporal, control_mask, intensity)
+    return blend_effect(color, temporal, control_mask, intensity)
 
 
 def compose_detail(source: torch.Tensor, output: torch.Tensor, *, detail_strength: float = 1.0,

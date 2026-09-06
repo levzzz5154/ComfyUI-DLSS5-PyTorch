@@ -22,6 +22,17 @@ def compose_head(
         raise ValueError("head and colour must share height and width")
     residual = half(head[..., :3]) * np.float32(0.25)
     predicted = np.clip(color + residual, 0, 1)
+    return blend_effect(color, predicted, control_mask=control_mask, intensity=intensity)
+
+
+def blend_effect(
+    color: np.ndarray,
+    predicted: np.ndarray,
+    control_mask: np.ndarray | None = None,
+    intensity: float = 1.0,
+) -> np.ndarray:
+    if not math.isfinite(intensity):
+        raise ValueError("intensity must be finite")
     blend = np.float32(intensity)
     if control_mask is not None:
         control_mask = np.asarray(control_mask, dtype=np.float32)

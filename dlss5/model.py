@@ -147,7 +147,8 @@ def vendor_approximate_softmax(value: torch.Tensor) -> torch.Tensor:
     if value.shape[-1] % 2:
         raise ValueError("vendor softmax expects an even token count")
     if torch.jit.is_tracing():
-        return e4m3_round_trip(value.softmax(dim=-1))
+        probabilities = value.softmax(dim=-1)
+        return e4m3_round_trip(probabilities) if value.shape[-1] <= 64 else probabilities.half().to(value.dtype)
     affine = (value.to(torch.float16).to(torch.float32) * 0.044921875 + 1.30078125).to(
         torch.float16
     )
@@ -161,6 +162,11 @@ def vendor_approximate_softmax(value: torch.Tensor) -> torch.Tensor:
         dim=-1,
     ).reshape(bits.shape)
     weights = weight_bits.to(torch.int16).view(torch.float16)
+    if value.shape[-1] > 64:
+        # Variable-length global rows can underflow entirely in unscaled E4M3.
+        # Keep half probabilities and accumulate totals in float to avoid overflow.
+        weights = weights.float()
+        return (weights / weights.sum(dim=-1, keepdim=True)).half().to(value.dtype)
     totals = weights.sum(dim=-1, keepdim=True, dtype=torch.float16)
     reciprocal = totals.to(torch.float32).reciprocal().to(torch.float16)
     probabilities = (weights * reciprocal).to(value.dtype)
